@@ -88,5 +88,17 @@
     "type": "int",
     "default": 3,
     "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次"
+  },
+  "judge_prompt_template": {
+    "description": "判断提示词模板",
+    "type": "string",
+    "default": "",
+    "hint": "自定义判断提示词模板，支持变量替换：{persona_system_prompt}, {event_unified_msg_origin}, {chat_state_energy}, {minutes_since_last_reply}, {chat_context}, {context_messages_count}, {recent_messages}, {last_bot_reply}, {sender_name}, {message_str}, {current_time}, {reply_threshold}, {reasoning_part}。留空使用默认模板。"
+  },
+  "summarize_prompt_template": {
+    "description": "系统提示词总结模板",
+    "type": "string",
+    "default": "",
+    "hint": "自定义系统提示词总结模板，支持变量替换：{original_prompt}。留空使用默认模板。"
   }
 }

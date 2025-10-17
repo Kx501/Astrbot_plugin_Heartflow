@@ -66,6 +66,10 @@ class HeartflowPlugin(star.Star):
         self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
         self.judge_max_retries = max(0, self.config.get("judge_max_retries", 3))  # 确保最小为0
         
+        # 提示词配置
+        self.judge_prompt_template = self.config.get("judge_prompt_template", "")
+        self.summarize_prompt_template = self.config.get("summarize_prompt_template", "")
+        
         # 判断权重配置
         self.weights = {
             "relevance": self.config.get("judge_relevance", 0.25),
@@ -138,7 +142,11 @@ class HeartflowPlugin(star.Star):
             if not judge_provider:
                 return original_prompt
             
-            summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
+            # 使用配置的提示词模板，如果没有配置则使用默认模板
+            if self.summarize_prompt_template:
+                summarize_prompt = self.summarize_prompt_template.format(original_prompt=original_prompt)
+            else:
+                summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
 总结后的内容应该在100-200字以内，突出最重要的角色特点。
 
 原始角色设定：
@@ -149,7 +157,7 @@ class HeartflowPlugin(star.Star):
     "summarized_persona": "精简后的角色设定，保留核心特征和行为方式"
 }}
 
-**重要：你的回复必须是完整的JSON对象，不要包含任何其他内容！**"""
+重要：你的回复必须是完整的JSON对象，不要包含任何其他内容！"""
 
             llm_response = await judge_provider.text_chat(
                 prompt=summarize_prompt,
@@ -219,60 +227,78 @@ class HeartflowPlugin(star.Star):
         if self.judge_include_reasoning:
             reasoning_part = ',\n    "reasoning": "详细分析原因，说明为什么应该或不应该回复，需要结合机器人角色特点进行分析，特别说明与上次回复的关联性"'
 
-        judge_prompt = f"""
+        # 使用配置的提示词模板，如果没有配置则使用默认模板
+        if self.judge_prompt_template:
+            judge_prompt = self.judge_prompt_template.format(
+                persona_system_prompt=persona_system_prompt if persona_system_prompt else "默认角色：智能助手",
+                event_unified_msg_origin=event.unified_msg_origin,
+                chat_state_energy=chat_state.energy,
+                minutes_since_last_reply=self._get_minutes_since_last_reply(event.unified_msg_origin),
+                chat_context=chat_context,
+                context_messages_count=self.context_messages_count,
+                recent_messages=recent_messages,
+                last_bot_reply=last_bot_reply if last_bot_reply else "暂无上次回复记录",
+                sender_name=event.get_sender_name(),
+                message_str=event.message_str,
+                current_time=datetime.datetime.now().strftime('%H:%M:%S'),
+                reply_threshold=self.reply_threshold,
+                reasoning_part=reasoning_part
+            )
+        else:
+            judge_prompt = f"""
 你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
 
-## 机器人角色设定
+机器人角色设定:
 {persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
 
-## 当前群聊情况
+当前群聊情况:
 - 群聊ID: {event.unified_msg_origin}
 - 我的精力水平: {chat_state.energy:.1f}/1.0
 - 上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
 
-## 群聊基本信息
+群聊基本信息:
 {chat_context}
 
-## 最近{self.context_messages_count}条对话历史
+最近{self.context_messages_count}条对话历史:
 {recent_messages}
 
-## 上次机器人回复
+上次机器人回复:
 {last_bot_reply if last_bot_reply else "暂无上次回复记录"}
 
-## 待判断消息
+待判断消息:
 发送者: {event.get_sender_name()}
 内容: {event.message_str}
 时间: {datetime.datetime.now().strftime('%H:%M:%S')}
 
-## 评估要求
-请从以下5个维度评估（0-10分），**重要提醒：基于上述机器人角色设定来判断是否适合回复**：
+评估要求:
+请从以下5个维度评估（0-10分），重要提醒：基于上述机器人角色设定来判断是否适合回复：
 
-1. **内容相关度**(0-10)：消息是否有趣、有价值、适合我回复
+1. 内容相关度(0-10)：消息是否有趣、有价值、适合我回复
    - 考虑消息的质量、话题性、是否需要回应
    - 识别并过滤垃圾消息、无意义内容
-   - **结合机器人角色特点，判断是否符合角色定位**
+   - 结合机器人角色特点，判断是否符合角色定位
 
-2. **回复意愿**(0-10)：基于当前状态，我回复此消息的意愿
+2. 回复意愿(0-10)：基于当前状态，我回复此消息的意愿
    - 考虑当前精力水平和心情状态
    - 考虑今日回复频率控制
-   - **基于机器人角色设定，判断是否应该主动参与此话题**
+   - 基于机器人角色设定，判断是否应该主动参与此话题
 
-3. **社交适宜性**(0-10)：在当前群聊氛围下回复是否合适
+3. 社交适宜性(0-10)：在当前群聊氛围下回复是否合适
    - 考虑群聊活跃度和讨论氛围
-   - **考虑机器人角色在群中的定位和表现方式**
+   - 考虑机器人角色在群中的定位和表现方式
 
-4. **时机恰当性**(0-10)：回复时机是否恰当
+4. 时机恰当性(0-10)：回复时机是否恰当
    - 考虑距离上次回复的时间间隔
    - 考虑消息的紧急性和时效性
 
-5. **对话连贯性**(0-10)：当前消息与上次机器人回复的关联程度
+5. 对话连贯性(0-10)：当前消息与上次机器人回复的关联程度
    - 如果当前消息是对上次回复的回应或延续，应给高分
    - 如果当前消息与上次回复完全无关，给中等分数
    - 如果没有上次回复记录，给默认分数5分
 
-**回复阈值**: {self.reply_threshold} (综合评分达到此分数才回复)
+回复阈值: {self.reply_threshold} (综合评分达到此分数才回复)
 
-**重要！！！请严格按照以下JSON格式回复，不要添加任何其他内容：**
+重要！！！请严格按照以下JSON格式回复，不要添加任何其他内容：
 
 请以JSON格式回复：
 {{
@@ -283,7 +309,7 @@ class HeartflowPlugin(star.Star):
     "continuity": 分数{reasoning_part}
 }}
 
-**注意：你的回复必须是完整的JSON对象，不要包含任何解释性文字或其他内容！**
+注意：你的回复必须是完整的JSON对象，不要包含任何解释性文字或其他内容！
 """
 
         try:
@@ -294,7 +320,7 @@ class HeartflowPlugin(star.Star):
             complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
             if persona_system_prompt:
                 complete_judge_prompt += f"\n\n你正在为以下角色的机器人做决策：\n{persona_system_prompt}"
-            complete_judge_prompt += "\n\n**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**\n\n"
+            complete_judge_prompt += "\n\n重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！\n\n"
             complete_judge_prompt += judge_prompt
 
             # 重试机制：使用配置的重试次数
@@ -369,8 +395,8 @@ class HeartflowPlugin(star.Star):
                     else:
                         # 还有重试机会，添加更强的提示
                         complete_judge_prompt = complete_judge_prompt.replace(
-                            "**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**",
-                            f"**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！**"
+                            "重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！",
+                            f"重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！"
                         )
                         continue
 
@@ -612,36 +638,36 @@ class HeartflowPlugin(star.Star):
         chat_state = self._get_chat_state(chat_id)
 
         status_info = f"""
-🔮 心流状态报告
+心流状态报告
 
-📊 **当前状态**
+当前状态:
 - 群聊ID: {event.unified_msg_origin}
-- 精力水平: {chat_state.energy:.2f}/1.0 {'🟢' if chat_state.energy > 0.7 else '🟡' if chat_state.energy > 0.3 else '🔴'}
+- 精力水平: {chat_state.energy:.2f}/1.0 {'高' if chat_state.energy > 0.7 else '中' if chat_state.energy > 0.3 else '低'}
 - 上次回复: {self._get_minutes_since_last_reply(chat_id)}分钟前
 
-📈 **历史统计**
+历史统计:
 - 总消息数: {chat_state.total_messages}
 - 总回复数: {chat_state.total_replies}
 - 回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
 
-⚙️ **配置参数**
+配置参数:
 - 回复阈值: {self.reply_threshold}
 - 判断提供商: {self.judge_provider_name}
 - 最大重试次数: {self.judge_max_retries}
-- 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
+- 白名单模式: {'开启' if self.whitelist_enabled else '关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
-🧠 **智能缓存**
+智能缓存:
 - 系统提示词缓存: {len(self.system_prompt_cache)} 个
 
-🎯 **评分权重**
+评分权重:
 - 内容相关度: {self.weights['relevance']:.0%}
 - 回复意愿: {self.weights['willingness']:.0%}
 - 社交适宜性: {self.weights['social']:.0%}
 - 时机恰当性: {self.weights['timing']:.0%}
 - 对话连贯性: {self.weights['continuity']:.0%}
 
-🎯 **插件状态**: {'✅ 已启用' if self.config.get('enable_heartflow', False) else '❌ 已禁用'}
+插件状态: {'已启用' if self.config.get('enable_heartflow', False) else '已禁用'}
 """
 
         event.set_result(event.plain_result(status_info))
@@ -655,7 +681,7 @@ class HeartflowPlugin(star.Star):
         if chat_id in self.chat_states:
             del self.chat_states[chat_id]
 
-        event.set_result(event.plain_result("✅ 心流状态已重置"))
+        event.set_result(event.plain_result("心流状态已重置"))
         logger.info(f"心流状态已重置: {chat_id}")
 
     # 管理员命令：查看系统提示词缓存
@@ -663,22 +689,22 @@ class HeartflowPlugin(star.Star):
     async def heartflow_cache_status(self, event: AstrMessageEvent):
         """查看系统提示词缓存状态"""
         
-        cache_info = "🧠 系统提示词缓存状态\n\n"
+        cache_info = "系统提示词缓存状态\n\n"
         
         if not self.system_prompt_cache:
-            cache_info += "📭 当前无缓存记录"
+            cache_info += "当前无缓存记录"
         else:
-            cache_info += f"📝 总缓存数量: {len(self.system_prompt_cache)}\n\n"
+            cache_info += f"总缓存数量: {len(self.system_prompt_cache)}\n\n"
             
             for cache_key, cache_data in self.system_prompt_cache.items():
                 original_len = len(cache_data.get("original", ""))
                 summarized_len = len(cache_data.get("summarized", ""))
                 persona_id = cache_data.get("persona_id", "unknown")
                 
-                cache_info += f"🔑 **缓存键**: {cache_key}\n"
-                cache_info += f"👤 **人格ID**: {persona_id}\n"
-                cache_info += f"📏 **压缩率**: {original_len} -> {summarized_len} ({(1-summarized_len/max(1,original_len))*100:.1f}% 压缩)\n"
-                cache_info += f"📄 **精简内容**: {cache_data.get('summarized', '')[:100]}...\n\n"
+                cache_info += f"缓存键: {cache_key}\n"
+                cache_info += f"人格ID: {persona_id}\n"
+                cache_info += f"压缩率: {original_len} -> {summarized_len} ({(1-summarized_len/max(1,original_len))*100:.1f}% 压缩)\n"
+                cache_info += f"精简内容: {cache_data.get('summarized', '')[:100]}...\n\n"
         
         event.set_result(event.plain_result(cache_info))
 
@@ -690,7 +716,7 @@ class HeartflowPlugin(star.Star):
         cache_count = len(self.system_prompt_cache)
         self.system_prompt_cache.clear()
         
-        event.set_result(event.plain_result(f"✅ 已清除 {cache_count} 个系统提示词缓存"))
+        event.set_result(event.plain_result(f"已清除 {cache_count} 个系统提示词缓存"))
         logger.info(f"系统提示词缓存已清除，共清除 {cache_count} 个缓存")
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
