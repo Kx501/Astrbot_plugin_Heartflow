@@ -74,7 +74,9 @@ class HeartflowPlugin(star.Star):
         # 工作原理：
         # 1. 用户消息：立即记录到缓冲区
         # 2. 机器人回复：从conversation_manager同步到缓冲区
-        # 3. 判断时：优先使用缓冲区，回退到conversation_manager
+        # 3. 判断时：使用缓冲区的完整历史
+        #
+        # 注意：缓冲区采用"从现在开始记录"策略，不回溯历史
         self.message_buffer: Dict[str, list] = {}
         self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
 
@@ -626,9 +628,9 @@ class HeartflowPlugin(star.Star):
         """获取最近的对话上下文（用于传递给小参数模型）
         
         工作流程：
-            1. 优先使用插件自己的消息缓冲区（包含所有消息，包括未回复的）
-            2. 如果缓冲区为空，回退到AstrBot的conversation_manager
-            3. 为消息添加[群友消息]和[我的回复]标注，帮助小模型识别对话对象
+            1. 使用插件自己的消息缓冲区（包含完整历史，包括未回复的消息）
+            2. 为消息添加[群友消息]和[我的回复]标注，帮助小模型识别对话对象
+            3. 返回最近N条消息（由context_messages_count配置）
             
         返回格式：
             [
@@ -636,77 +638,46 @@ class HeartflowPlugin(star.Star):
                 {"role": "assistant", "content": "[我的回复] ..."}
             ]
             
+        策略说明：
+            - 只使用缓冲区，不回退到conversation_manager
+            - 如果缓冲区为空，返回空列表（首次运行时的正常情况）
+            - 随着消息积累，缓冲区会逐渐填充完整
+            
         注意：
             - 机器人回复的同步已经在on_group_message开始时完成
-            - 过滤掉函数调用等复杂内容，避免小模型报错
         """
         chat_id = event.unified_msg_origin
         
-        # 优先使用插件缓冲区
-        if chat_id in self.message_buffer and self.message_buffer[chat_id]:
-            buffer_messages = self.message_buffer[chat_id]
-            # 获取最近的 context_messages_count 条消息
-            recent_messages = buffer_messages[-self.context_messages_count:] if len(buffer_messages) > self.context_messages_count else buffer_messages
-            
-            filtered_context = []
-            for msg in recent_messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                
-                if role in ["user", "assistant"] and content:
-                    # 添加标注
-                    if role == "user":
-                        clean_msg = {
-                            "role": role,
-                            "content": f"[群友消息] {content}"
-                        }
-                    else:  # assistant
-                        clean_msg = {
-                            "role": role,
-                            "content": f"[我的回复] {content}"
-                        }
-                    filtered_context.append(clean_msg)
-            
-            logger.info(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 原始消息数: {len(buffer_messages)}")
-            return filtered_context
-        
-        # 回退到conversation_manager
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return []
-
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return []
-
-            context = json.loads(conversation.history)
-            recent_context = context[-self.context_messages_count:] if len(context) > self.context_messages_count else context
-
-            filtered_context = []
-            for msg in recent_context:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                
-                if role in ["user", "assistant"] and content and isinstance(content, str):
-                    if role == "user":
-                        clean_msg = {
-                            "role": role,
-                            "content": f"[群友消息] {content}"
-                        }
-                    else:
-                        clean_msg = {
-                            "role": role,
-                            "content": f"[我的回复] {content}"
-                        }
-                    filtered_context.append(clean_msg)
-
-            logger.debug(f"从conversation_manager获取到 {len(filtered_context)} 条消息")
-            return filtered_context
-
-        except Exception as e:
-            logger.debug(f"获取对话上下文失败: {e}")
+        # 使用插件缓冲区
+        if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
+            logger.debug(f"缓冲区为空，返回空上下文（首次运行或刚重载）")
             return []
+        
+        buffer_messages = self.message_buffer[chat_id]
+        # 获取最近的 context_messages_count 条消息
+        recent_messages = buffer_messages[-self.context_messages_count:] if len(buffer_messages) > self.context_messages_count else buffer_messages
+        
+        filtered_context = []
+        for msg in recent_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            if role in ["user", "assistant"] and content:
+                # 添加标注，帮助小模型识别对话对象
+                if role == "user":
+                    clean_msg = {
+                        "role": role,
+                        "content": f"[群友消息] {content}"
+                    }
+                else:  # assistant
+                    clean_msg = {
+                        "role": role,
+                        "content": f"[我的回复] {content}"
+                    }
+                filtered_context.append(clean_msg)
+        
+        logger.info(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
+        return filtered_context
 
     async def _build_chat_context(self, event: AstrMessageEvent) -> str:
         """构建群聊上下文"""
