@@ -110,6 +110,7 @@ class HeartflowPlugin(star.Star):
         self.enable_global_favorability = self.config.get("enable_global_favorability", False)
         self.favorability_impact_strength = self.config.get("favorability_impact_strength", 1.0)
         self.favorability_decay_daily = self.config.get("favorability_decay_daily", 1.0)
+        self.initial_favorability = self.config.get("initial_favorability", 10.0)  # 新用户初始好感度
         
         # 全局好感度存储：{user_id: favorability}
         # 跨群聊的用户好感度，不受白名单限制
@@ -750,7 +751,7 @@ class HeartflowPlugin(star.Star):
                     json.dump(global_data, f, ensure_ascii=False, indent=2)
                 
                 logger.debug(f"全局好感度数据已保存，共{len(self.global_favorability)}个用户")
-            
+
         except Exception as e:
             logger.error(f"保存好感度数据失败: {e}")
     
@@ -779,9 +780,11 @@ class HeartflowPlugin(star.Star):
         全局好感度条件：
         - enable_global_favorability = True
         - 如果启用了白名单，当前群聊必须在白名单中
+        
+        新用户默认好感度：由initial_favorability配置（默认30）
         """
         if not self.enable_favorability:
-            return 50.0  # 系统未启用，返回中性值
+            return self.initial_favorability  # 系统未启用，返回初始值
         
         # 检查是否使用全局好感度
         use_global = self.enable_global_favorability
@@ -796,7 +799,7 @@ class HeartflowPlugin(star.Star):
         
         # 使用群聊本地好感度
         chat_state = self._get_chat_state(chat_id)
-        return chat_state.user_favorability.get(user_id, 50.0)
+        return chat_state.user_favorability.get(user_id, self.initial_favorability)
     
     def _get_user_interaction_count(self, chat_id: str, user_id: str) -> int:
         """获取用户互动次数"""
@@ -850,32 +853,32 @@ class HeartflowPlugin(star.Star):
             norm_timing * self.fav_weights["timing"]
         )
         
-        # === 映射到好感度变化（-5 到 +5） ===
+        # === 映射到好感度变化（-5 到 +3） ===
         # 使用分段线性映射
         if quality_score > 0.8:
-            # 非常好的互动 → +3 到 +5
-            delta = 3.0 + (quality_score - 0.8) / 0.2 * 2.0
+            # 非常好的互动 → +2 到 +3
+            delta = 2.0 + (quality_score - 0.8) / 0.2 * 1.0
         elif quality_score > 0.6:
-            # 良好的互动 → +1 到 +3
-            delta = 1.0 + (quality_score - 0.6) / 0.2 * 2.0
+            # 良好的互动 → +0.8 到 +2
+            delta = 0.8 + (quality_score - 0.6) / 0.2 * 1.2
         elif quality_score > 0.4:
-            # 普通互动 → -0.5 到 +1
-            delta = -0.5 + (quality_score - 0.4) / 0.2 * 1.5
+            # 普通互动 → -1.0 到 +0.8
+            delta = -1.0 + (quality_score - 0.4) / 0.2 * 1.8
         elif quality_score > 0.2:
-            # 较差互动 → -2 到 -0.5
-            delta = -2.0 + (quality_score - 0.2) / 0.2 * 1.5
+            # 较差互动 → -2.5 到 -1.0
+            delta = -2.5 + (quality_score - 0.2) / 0.2 * 1.5
         else:
-            # 很差的互动 → -5 到 -2
-            delta = -5.0 + quality_score / 0.2 * 3.0
+            # 很差的互动 → -5 到 -2.5
+            delta = -5.0 + quality_score / 0.2 * 2.5
         
         # === 互动结果修正 ===
         if did_reply:
-            # 我们回复了，说明互动成功，小幅加成
-            delta += 0.5
+            # 回复了，说明互动成功，轻微加成
+            delta += 0.3
         else:
             # 没回复，如果质量还可以，轻微减少好感
             if quality_score > 0.5:
-                delta -= 0.3
+                delta -= 0.2
         
         # === 限制范围 ===
         return max(-5.0, min(5.0, delta))
@@ -893,7 +896,7 @@ class HeartflowPlugin(star.Star):
         # 更新群聊本地好感度
         chat_state = self._get_chat_state(chat_id)
         
-        current = chat_state.user_favorability.get(user_id, 50.0)
+        current = chat_state.user_favorability.get(user_id, self.initial_favorability)
         new_value = max(0.0, min(100.0, current + delta))
         chat_state.user_favorability[user_id] = new_value
         
@@ -906,7 +909,7 @@ class HeartflowPlugin(star.Star):
                     can_update_global = False  # 不在白名单中，不更新全局好感度
             
             if can_update_global:
-                global_current = self.global_favorability.get(user_id, 50.0)
+                global_current = self.global_favorability.get(user_id, self.initial_favorability)
                 global_new = max(0.0, min(100.0, global_current + delta))
                 self.global_favorability[user_id] = global_new
         
