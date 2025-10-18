@@ -106,5 +106,59 @@
     "type": "int",
     "default": 50,
     "hint": "每个群聊最多缓存的消息数量，用于保存完整对话历史（包括未回复的消息）。建议15-100条。"
+  },
+  "enable_favorability": {
+    "description": "启用好感度系统",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，机器人会记住与每个用户的互动质量，调整对不同用户的回复积极性。好感度高的用户更容易获得回复。"
+  },
+  "enable_global_favorability": {
+    "description": "启用全局好感度",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，用户的好感度在所有群聊中共享。注意：如果启用了白名单，全局好感度也只在白名单群聊中生效。前置条件：enable_favorability=true"
+  },
+  "favorability_impact_strength": {
+    "description": "好感度影响强度",
+    "type": "float",
+    "default": 1.0,
+    "hint": "好感度对回复阈值的影响程度。0=无影响，1.0=标准影响（±0.2阈值），2.0=双倍影响。"
+  },
+  "favorability_decay_daily": {
+    "description": "每日好感度衰减",
+    "type": "float",
+    "default": 1.0,
+    "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0。"
+  },
+  "fav_weight_relevance": {
+    "description": "好感度计算-内容相关度权重",
+    "type": "float",
+    "default": 0.4,
+    "hint": "内容质量对好感度的影响权重，默认40%"
+  },
+  "fav_weight_social": {
+    "description": "好感度计算-社交适宜性权重",
+    "type": "float",
+    "default": 0.3,
+    "hint": "社交礼貌对好感度的影响权重，默认30%"
+  },
+  "fav_weight_continuity": {
+    "description": "好感度计算-对话连贯性权重",
+    "type": "float",
+    "default": 0.2,
+    "hint": "对话延续性对好感度的影响权重，默认20%"
+  },
+  "fav_weight_willingness": {
+    "description": "好感度计算-回复意愿权重",
+    "type": "float",
+    "default": 0.05,
+    "hint": "回复意愿对好感度的影响权重，默认5%"
+  },
+  "fav_weight_timing": {
+    "description": "好感度计算-时机恰当性权重",
+    "type": "float",
+    "default": 0.05,
+    "hint": "时机把握对好感度的影响权重，默认5%"
   }
 }

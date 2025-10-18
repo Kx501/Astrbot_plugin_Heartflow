@@ -1,12 +1,15 @@
 import json
 import time
 import datetime
+import asyncio
 from typing import Dict
 from dataclasses import dataclass
+from pathlib import Path
 
 import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
+from astrbot.api.star import StarTools
 
 
 @dataclass
@@ -36,6 +39,16 @@ class ChatState:
     last_reset_date: str = ""
     total_messages: int = 0
     total_replies: int = 0
+    # 好感度系统
+    user_favorability: Dict[str, float] = None  # {user_id: favorability (0-100)}
+    user_interaction_count: Dict[str, int] = None  # {user_id: count}
+    last_favorability_decay: str = ""  # 上次好感度衰减日期
+    
+    def __post_init__(self):
+        if self.user_favorability is None:
+            self.user_favorability = {}
+        if self.user_interaction_count is None:
+            self.user_interaction_count = {}
 
 
 
@@ -88,6 +101,26 @@ class HeartflowPlugin(star.Star):
         self.judge_evaluation_rules = self.config.get("judge_evaluation_rules", "")
         self.summarize_instruction = self.config.get("summarize_instruction", "")
         
+        # 好感度系统配置
+        self.enable_favorability = self.config.get("enable_favorability", False)
+        self.enable_global_favorability = self.config.get("enable_global_favorability", False)
+        self.favorability_impact_strength = self.config.get("favorability_impact_strength", 1.0)
+        self.favorability_decay_daily = self.config.get("favorability_decay_daily", 1.0)
+        
+        # 全局好感度存储：{user_id: favorability}
+        # 跨群聊的用户好感度，不受白名单限制
+        self.global_favorability: Dict[str, float] = {}
+        self.global_interaction_count: Dict[str, int] = {}
+        
+        # 好感度计算权重
+        self.fav_weights = {
+            "relevance": self.config.get("fav_weight_relevance", 0.4),
+            "social": self.config.get("fav_weight_social", 0.3),
+            "continuity": self.config.get("fav_weight_continuity", 0.2),
+            "willingness": self.config.get("fav_weight_willingness", 0.05),
+            "timing": self.config.get("fav_weight_timing", 0.05)
+        }
+        
         # 判断权重配置
         self.weights = {
             "relevance": self.config.get("judge_relevance", 0.25),
@@ -103,6 +136,25 @@ class HeartflowPlugin(star.Star):
             # 进行归一化处理
             self.weights = {k: v / weight_sum for k, v in self.weights.items()}
             logger.info(f"判断权重和已归一化，当前配置为: {self.weights}")
+
+        # 获取插件数据目录
+        try:
+            self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
+            self.favorability_file = self.data_dir / "favorability.json"
+            self.global_favorability_file = self.data_dir / "global_favorability.json"
+            logger.info(f"插件数据目录: {self.data_dir}")
+        except Exception as e:
+            logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
+            self.enable_favorability = False  # 获取路径失败，关闭好感度系统
+            self.data_dir = None
+            self.favorability_file = None
+            self.global_favorability_file = None
+        
+        # 加载好感度数据
+        if self.enable_favorability:
+            self._load_favorability()
+            # 启动自动保存任务
+            asyncio.create_task(self._auto_save_task())
 
         logger.info("心流插件已初始化")
 
@@ -250,13 +302,10 @@ class HeartflowPlugin(star.Star):
 1. 内容相关度(0-10)：消息是否有趣、有价值、适合我回复
    - 考虑消息的质量、话题性、是否需要回应
    - 识别并过滤垃圾消息、无意义内容
-   - 关键判断：这条消息是对我说的吗？
-     * 查看对话历史，如果消息是在回复[我的回复]，给高分
-     * 如果是群友之间的对话，与我无关，给低分
    - 结合机器人角色特点，判断是否符合角色定位
 
 2. 回复意愿(0-10)：基于当前状态，我回复此消息的意愿
-   - 考虑当前精力水平和心情状态
+   - 考虑当前精力水平和对用户的印象
    - 考虑今日回复频率控制
    - 基于机器人角色设定，判断是否应该主动参与此话题
 
@@ -270,16 +319,27 @@ class HeartflowPlugin(star.Star):
 
 5. 对话连贯性(0-10)：当前消息与上次机器人回复的关联程度
    - 查看对话历史中最后的[我的回复]
-   - 如果当前消息是对我上次回复的回应或延续 → 高分
-   - 如果当前消息与我上次回复无关 → 中等分数
-   - 如果对话历史中没有我的回复记录 → 默认5分"""
+   - 如果当前消息是对我上次回复的回应或延续，给高分
+   - 如果当前消息与我上次回复无关，给中等分数
+   - 如果对话历史中没有我的回复记录，给低分"""
 
+        # 获取好感度信息
+        user_id = event.get_sender_id()
+        user_fav = self._get_user_favorability(event.unified_msg_origin, user_id)
+        interaction_count = self._get_user_interaction_count(event.unified_msg_origin, user_id)
+        
+        # 好感度描述
+        fav_info = ""
+        if self.enable_favorability:
+            level, emoji = self._get_favorability_level(user_fav)
+            fav_info = f"\n对当前用户的好感度: {user_fav:.0f}/100 ({level} {emoji})\n互动历史: {interaction_count}次"
+        
         # 构建完整的判断提示词
         judge_prompt = f"""
 你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
 
 重要说明：
-- 对话历史已通过上下文(contexts)参数提供，你可以查看完整的对话流程
+- 对话历史已提供给你，你可以查看完整的对话流程
 - [群友消息] = 群友发送的消息
 - [我的回复] = 机器人（我）发送的回复
 
@@ -289,11 +349,11 @@ class HeartflowPlugin(star.Star):
 当前群聊ID:
 {event.unified_msg_origin}
 
-机器人情况:
+机器人状态:
 我的精力水平: {chat_state.energy:.1f}/1.0
 最近活跃度: {'高' if chat_state.total_messages > 100 else '中' if chat_state.total_messages > 20 else '低'}
 上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
-历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
+历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%{fav_info}
 
 待判断消息:
 发送者: {event.get_sender_name()}
@@ -372,8 +432,15 @@ class HeartflowPlugin(star.Star):
                         continuity * self.weights["continuity"]
                     ) / 10.0
 
-                    # 根据综合评分判断是否应该回复
-                    should_reply = overall_score >= self.reply_threshold
+                    # 应用好感度调整
+                    threshold_adjustment = self._get_threshold_adjustment(user_fav)
+                    adjusted_threshold = self.reply_threshold + threshold_adjustment
+                    
+                    # 根据调整后的阈值判断是否应该回复
+                    should_reply = overall_score >= adjusted_threshold
+                    
+                    if self.enable_favorability and abs(threshold_adjustment) > 0.01:
+                        logger.debug(f"好感度调整阈值: {self.reply_threshold:.2f} → {adjusted_threshold:.2f} (好感度:{user_fav:.0f})")
 
                     logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
 
@@ -460,6 +527,14 @@ class HeartflowPlugin(star.Star):
                 
                 # 更新主动回复状态（精力消耗、统计等）
                 self._update_active_state(event, judge_result)
+                
+                # 更新好感度（回复了）
+                if self.enable_favorability:
+                    user_id = event.get_sender_id()
+                    fav_delta = self._calculate_favorability_change(judge_result, did_reply=True)
+                    self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
+                    self._record_interaction(event.unified_msg_origin, user_id)
+                
                 logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
                 
                 # 注意：机器人的回复由AstrBot核心系统生成并保存到conversation_manager
@@ -471,6 +546,13 @@ class HeartflowPlugin(star.Star):
                 # 判断不需要回复，只更新被动状态
                 logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
                 await self._update_passive_state(event, judge_result)
+                
+                # 更新好感度（没回复）
+                if self.enable_favorability:
+                    user_id = event.get_sender_id()
+                    fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
+                    self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
+                    self._record_interaction(event.unified_msg_origin, user_id)
 
         except Exception as e:
             logger.error(f"心流插件处理消息异常: {e}")
@@ -522,6 +604,11 @@ class HeartflowPlugin(star.Star):
             state.last_reset_date = today
             # 每日重置时恢复一些精力
             state.energy = min(1.0, state.energy + 0.2)
+        
+        # 好感度每日衰减
+        if self.enable_favorability and state.last_favorability_decay != today:
+            state.last_favorability_decay = today
+            self._apply_favorability_decay(chat_id)
 
         return state
 
@@ -533,6 +620,314 @@ class HeartflowPlugin(star.Star):
             return 999  # 从未回复过
 
         return int((time.time() - chat_state.last_reply_time) / 60)
+
+    # ===== 好感度系统方法 =====
+    
+    def _load_favorability(self):
+        """从文件加载好感度数据"""
+        try:
+            # 加载群聊好感度
+            if self.favorability_file.exists():
+                with open(self.favorability_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # 恢复数据到chat_states
+                for chat_id, chat_data in data.items():
+                    if chat_id not in self.chat_states:
+                        self.chat_states[chat_id] = ChatState()
+                    
+                    state = self.chat_states[chat_id]
+                    state.user_favorability = chat_data.get("favorability", {})
+                    state.user_interaction_count = chat_data.get("interaction_count", {})
+                    state.last_favorability_decay = chat_data.get("last_decay", "")
+                
+                logger.info(f"群聊好感度数据已加载，共{len(data)}个群聊")
+            else:
+                logger.info("未找到群聊好感度数据文件，使用默认值")
+            
+            # 加载全局好感度
+            if self.enable_global_favorability and self.global_favorability_file.exists():
+                with open(self.global_favorability_file, 'r', encoding='utf-8') as f:
+                    global_data = json.load(f)
+                
+                self.global_favorability = global_data.get("favorability", {})
+                self.global_interaction_count = global_data.get("interaction_count", {})
+                
+                logger.info(f"全局好感度数据已加载，共{len(self.global_favorability)}个用户")
+
+        except Exception as e:
+            logger.error(f"加载好感度数据失败: {e}")
+    
+    def _save_favorability(self):
+        """保存好感度数据到文件"""
+        try:
+            # 保存群聊好感度
+            data = {}
+            for chat_id, state in self.chat_states.items():
+                if state.user_favorability:  # 只保存有数据的群聊
+                    data[chat_id] = {
+                        "favorability": state.user_favorability,
+                        "interaction_count": state.user_interaction_count,
+                        "last_decay": state.last_favorability_decay
+                    }
+            
+            # 确保目录存在
+            self.favorability_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 保存群聊好感度
+            with open(self.favorability_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"群聊好感度数据已保存，共{len(data)}个群聊")
+            
+            # 保存全局好感度
+            if self.enable_global_favorability:
+                global_data = {
+                    "favorability": self.global_favorability,
+                    "interaction_count": self.global_interaction_count
+                }
+                
+                with open(self.global_favorability_file, 'w', encoding='utf-8') as f:
+                    json.dump(global_data, f, ensure_ascii=False, indent=2)
+                
+                logger.debug(f"全局好感度数据已保存，共{len(self.global_favorability)}个用户")
+            
+        except Exception as e:
+            logger.error(f"保存好感度数据失败: {e}")
+    
+    async def _auto_save_task(self):
+        """定期自动保存好感度数据"""
+        try:
+            while True:
+                await asyncio.sleep(300)  # 每5分钟保存一次
+                if self.enable_favorability:
+                    self._save_favorability()
+                    logger.debug("好感度数据已自动保存")
+        except asyncio.CancelledError:
+            # 任务被取消，保存数据
+            self._save_favorability()
+            logger.info("自动保存任务已停止")
+        except Exception as e:
+            logger.error(f"自动保存任务异常: {e}")
+    
+    def _get_user_favorability(self, chat_id: str, user_id: str) -> float:
+        """获取用户好感度（0-100）
+        
+        优先级：
+        1. 如果启用全局好感度且满足条件，返回全局好感度
+        2. 否则返回群聊本地好感度
+        
+        全局好感度条件：
+        - enable_global_favorability = True
+        - 如果启用了白名单，当前群聊必须在白名单中
+        """
+        if not self.enable_favorability:
+            return 50.0  # 系统未启用，返回中性值
+        
+        # 检查是否使用全局好感度
+        use_global = self.enable_global_favorability
+        
+        # 如果启用了白名单，全局好感度也受白名单控制
+        if use_global and self.whitelist_enabled:
+            if not self.chat_whitelist or chat_id not in self.chat_whitelist:
+                use_global = False  # 不在白名单中，不使用全局好感度
+        
+        if use_global and user_id in self.global_favorability:
+            return self.global_favorability[user_id]
+        
+        # 使用群聊本地好感度
+        chat_state = self._get_chat_state(chat_id)
+        return chat_state.user_favorability.get(user_id, 50.0)
+    
+    def _get_user_interaction_count(self, chat_id: str, user_id: str) -> int:
+        """获取用户互动次数"""
+        chat_state = self._get_chat_state(chat_id)
+        return chat_state.user_interaction_count.get(user_id, 0)
+    
+    def _get_favorability_level(self, favorability: float) -> tuple:
+        """获取好感度等级和emoji
+        
+        返回: (等级名称, emoji)
+        """
+        if favorability >= 80:
+            return ("挚友", "💖")
+        elif favorability >= 65:
+            return ("好友", "😊")
+        elif favorability >= 50:
+            return ("熟人", "🙂")
+        elif favorability >= 35:
+            return ("普通", "😐")
+        elif favorability >= 20:
+            return ("陌生", "😑")
+        else:
+            return ("冷淡", "😒")
+    
+    def _calculate_favorability_change(self, judge_result: JudgeResult, did_reply: bool) -> float:
+        """基于5个维度的归一化分数计算好感度变化
+        
+        优点：
+        - 不依赖具体分数阈值
+        - 适用于不同AI模型的评分习惯
+        - 基于相对值而非绝对值
+        
+        返回：-5.0 到 +5.0 的变化值
+        """
+        if not self.enable_favorability:
+            return 0.0
+        
+        # === 归一化5个维度（0-10 → 0-1） ===
+        norm_relevance = judge_result.relevance / 10.0
+        norm_social = judge_result.social / 10.0
+        norm_continuity = judge_result.continuity / 10.0
+        norm_willingness = judge_result.willingness / 10.0
+        norm_timing = judge_result.timing / 10.0
+        
+        # === 计算综合质量分（0-1） ===
+        quality_score = (
+            norm_relevance * self.fav_weights["relevance"] +
+            norm_social * self.fav_weights["social"] +
+            norm_continuity * self.fav_weights["continuity"] +
+            norm_willingness * self.fav_weights["willingness"] +
+            norm_timing * self.fav_weights["timing"]
+        )
+        
+        # === 映射到好感度变化（-5 到 +5） ===
+        # 使用分段线性映射
+        if quality_score > 0.8:
+            # 非常好的互动 → +3 到 +5
+            delta = 3.0 + (quality_score - 0.8) / 0.2 * 2.0
+        elif quality_score > 0.6:
+            # 良好的互动 → +1 到 +3
+            delta = 1.0 + (quality_score - 0.6) / 0.2 * 2.0
+        elif quality_score > 0.4:
+            # 普通互动 → -0.5 到 +1
+            delta = -0.5 + (quality_score - 0.4) / 0.2 * 1.5
+        elif quality_score > 0.2:
+            # 较差互动 → -2 到 -0.5
+            delta = -2.0 + (quality_score - 0.2) / 0.2 * 1.5
+        else:
+            # 很差的互动 → -5 到 -2
+            delta = -5.0 + quality_score / 0.2 * 3.0
+        
+        # === 互动结果修正 ===
+        if did_reply:
+            # 我们回复了，说明互动成功，小幅加成
+            delta += 0.5
+        else:
+            # 没回复，如果质量还可以，轻微减少好感
+            if quality_score > 0.5:
+                delta -= 0.3
+        
+        # === 限制范围 ===
+        return max(-5.0, min(5.0, delta))
+    
+    def _update_favorability(self, chat_id: str, user_id: str, delta: float):
+        """更新用户好感度
+        
+        根据配置同时更新：
+        1. 群聊本地好感度（总是更新）
+        2. 全局好感度（如果启用且满足白名单条件）
+        """
+        if not self.enable_favorability:
+            return
+        
+        # 更新群聊本地好感度
+        chat_state = self._get_chat_state(chat_id)
+        
+        current = chat_state.user_favorability.get(user_id, 50.0)
+        new_value = max(0.0, min(100.0, current + delta))
+        chat_state.user_favorability[user_id] = new_value
+        
+        # 更新全局好感度（如果启用）
+        if self.enable_global_favorability:
+            # 检查白名单限制
+            can_update_global = True
+            if self.whitelist_enabled:
+                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
+                    can_update_global = False  # 不在白名单中，不更新全局好感度
+            
+            if can_update_global:
+                global_current = self.global_favorability.get(user_id, 50.0)
+                global_new = max(0.0, min(100.0, global_current + delta))
+                self.global_favorability[user_id] = global_new
+        
+        if abs(delta) > 0.1:  # 只记录有意义的变化
+            logger.debug(f"好感度更新: {user_id[-4:]}... | 本地:{current:.1f}→{new_value:.1f} ({delta:+.1f})")
+    
+    def _record_interaction(self, chat_id: str, user_id: str):
+        """记录用户互动次数
+        
+        同时更新：
+        1. 群聊本地互动计数
+        2. 全局互动计数（如果启用且满足白名单条件）
+        """
+        if not self.enable_favorability:
+            return
+        
+        # 更新群聊本地互动计数
+        chat_state = self._get_chat_state(chat_id)
+        chat_state.user_interaction_count[user_id] = \
+            chat_state.user_interaction_count.get(user_id, 0) + 1
+        
+        # 更新全局互动计数（如果启用）
+        if self.enable_global_favorability:
+            # 检查白名单限制
+            can_update_global = True
+            if self.whitelist_enabled:
+                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
+                    can_update_global = False
+            
+            if can_update_global:
+                self.global_interaction_count[user_id] = \
+                    self.global_interaction_count.get(user_id, 0) + 1
+    
+    def _apply_favorability_decay(self, chat_id: str):
+        """应用好感度自然衰减
+        
+        设计理念：
+        - 好感度会随时间自然向50（中性）回归
+        - 高好感度衰减更快（避免永久高好感）
+        - 低好感度恢复更快（给用户改过机会）
+        """
+        chat_state = self._get_chat_state(chat_id)
+        decay_rate = self.favorability_decay_daily
+        
+        for user_id in list(chat_state.user_favorability.keys()):
+            current = chat_state.user_favorability[user_id]
+            
+            if current > 50:
+                # 高好感度向中性回归（衰减稍快）
+                decay = min(current - 50, decay_rate * 1.5)
+                chat_state.user_favorability[user_id] = current - decay
+            elif current < 50:
+                # 低好感度向中性恢复（恢复更快）
+                recovery = min(50 - current, decay_rate * 2.0)
+                chat_state.user_favorability[user_id] = current + recovery
+    
+    def _get_threshold_adjustment(self, favorability: float) -> float:
+        """根据好感度计算回复阈值调整
+        
+        使用平滑曲线，避免阈值突变
+        
+        Args:
+            favorability: 0-100
+        
+        Returns:
+            阈值调整值（-0.2 到 +0.2）
+        """
+        if not self.enable_favorability:
+            return 0.0
+        
+        # 归一化到 -1 到 +1
+        normalized = (favorability - 50) / 50
+        
+        # 使用线性映射
+        # 好感度100 → -0.2（更容易回复）
+        # 好感度50 → 0
+        # 好感度0 → +0.2（更难触发回复）
+        adjustment = -normalized * 0.2 * self.favorability_impact_strength
+        
+        return adjustment
 
     def _record_message(self, chat_id: str, role: str, content: str):
         """记录消息到缓冲区
@@ -588,7 +983,7 @@ class HeartflowPlugin(star.Star):
                 return
 
             context = json.loads(conversation.history)
-            
+
             # 从后往前找最后一条assistant消息
             last_assistant_msg = None
             for msg in reversed(context):
@@ -610,7 +1005,7 @@ class HeartflowPlugin(star.Star):
                 # 新的回复，添加到缓冲区
                 self._record_message(chat_id, "assistant", last_assistant_msg)
                 logger.debug(f"同步机器人回复到缓冲区: {last_assistant_msg[:30]}...")
-                        
+
         except Exception as e:
             logger.debug(f"同步机器人回复失败: {e}")
     
@@ -714,6 +1109,26 @@ class HeartflowPlugin(star.Star):
 
         chat_id = event.unified_msg_origin
         chat_state = self._get_chat_state(chat_id)
+        
+        # 好感度统计
+        fav_stats = ""
+        if self.enable_favorability:
+            # 根据是否启用全局好感度，选择数据源
+            fav_data = self.global_favorability if self.enable_global_favorability else chat_state.user_favorability
+            fav_scope = "全局" if self.enable_global_favorability else "当前群聊"
+            
+            total_users = len(fav_data)
+            if total_users > 0:
+                avg_fav = sum(fav_data.values()) / total_users
+                high_fav = len([f for f in fav_data.values() if f >= 70])
+                low_fav = len([f for f in fav_data.values() if f <= 30])
+                fav_stats = f"""
+好感度统计（{fav_scope}）:
+- 记录用户数: {total_users}
+- 平均好感度: {avg_fav:.1f}/100
+- 高好感用户: {high_fav}个 (≥70)
+- 低好感用户: {low_fav}个 (≤30)
+"""
 
         status_info = f"""
 心流状态报告
@@ -746,7 +1161,7 @@ class HeartflowPlugin(star.Star):
 - 时机恰当性: {self.weights['timing']:.0%}
 - 对话连贯性: {self.weights['continuity']:.0%}
 
-插件状态: {'已启用' if self.config.get('enable_heartflow', False) else '已禁用'}
+{fav_stats}
 """
 
         event.set_result(event.plain_result(status_info))
@@ -797,7 +1212,7 @@ class HeartflowPlugin(star.Star):
         
         event.set_result(event.plain_result(f"已清除 {cache_count} 个系统提示词缓存"))
         logger.info(f"系统提示词缓存已清除，共清除 {cache_count} 个缓存")
-    
+
     # 管理员命令：查看消息缓冲区状态
     @filter.command("heartflow_buffer")
     async def heartflow_buffer_status(self, event: AstrMessageEvent):
@@ -836,6 +1251,141 @@ class HeartflowPlugin(star.Star):
             logger.info(f"消息缓冲区已清除: {chat_id} ({msg_count} 条)")
         else:
             event.set_result(event.plain_result("当前群聊缓冲区为空，无需清除"))
+    
+    # 管理员命令：查看好感度
+    @filter.command("heartflow_fav")
+    async def heartflow_favorability(self, event: AstrMessageEvent):
+        """查看当前用户的好感度"""
+        
+        if not self.enable_favorability:
+            event.set_result(event.plain_result("好感度系统未启用"))
+            return
+        
+        chat_id = event.unified_msg_origin
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+        
+        # 获取实际使用的好感度
+        user_fav = self._get_user_favorability(chat_id, user_id)
+        interaction_count = self._get_user_interaction_count(chat_id, user_id)
+        level, emoji = self._get_favorability_level(user_fav)
+        threshold_adj = self._get_threshold_adjustment(user_fav)
+        
+        # 判断使用的是全局还是群聊好感度
+        fav_source = "全局（跨群聊）" if (self.enable_global_favorability and user_id in self.global_favorability) else "当前群聊"
+        
+        fav_info = f"""
+好感度报告
+
+用户：{user_name}
+用户ID：{user_id}
+
+好感度：{user_fav:.1f}/100 {emoji}
+关系等级：{level}
+互动次数：{interaction_count}次
+数据范围：{fav_source}
+
+影响效果：
+- 回复阈值调整：{threshold_adj:+.3f}
+- 实际阈值：{self.reply_threshold + threshold_adj:.3f}（原始：{self.reply_threshold}）
+- {'更容易获得回复' if threshold_adj < 0 else '更难获得回复' if threshold_adj > 0 else '无影响'}
+
+系统状态：
+- 好感度影响强度：{self.favorability_impact_strength}
+- 每日衰减速度：{self.favorability_decay_daily}
+"""
+        
+        event.set_result(event.plain_result(fav_info))
+    
+    # 管理员命令：好感度排行榜
+    @filter.command("heartflow_fav_rank")
+    async def heartflow_favorability_rank(self, event: AstrMessageEvent):
+        """查看当前群聊的好感度排行榜"""
+        
+        if not self.enable_favorability:
+            event.set_result(event.plain_result("好感度系统未启用"))
+            return
+        
+        chat_id = event.unified_msg_origin
+        chat_state = self._get_chat_state(chat_id)
+        
+        if not chat_state.user_favorability:
+            event.set_result(event.plain_result("当前群聊暂无好感度记录"))
+            return
+        
+        # 排序
+        sorted_users = sorted(
+            chat_state.user_favorability.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        result = "好感度排行榜\n\n"
+        for i, (uid, fav) in enumerate(sorted_users[:10], 1):
+            level, emoji = self._get_favorability_level(fav)
+            interaction = chat_state.user_interaction_count.get(uid, 0)
+            result += f"{i}. 用户{uid[-6:]}: {fav:.0f}/100 {emoji} ({level}, {interaction}次互动)\n"
+        
+        if len(sorted_users) > 10:
+            result += f"\n...还有{len(sorted_users) - 10}个用户"
+        
+        event.set_result(event.plain_result(result))
+    
+    # 管理员命令：重置好感度
+    @filter.command("heartflow_fav_reset")
+    async def heartflow_favorability_reset(self, event: AstrMessageEvent):
+        """重置当前群聊所有用户的好感度"""
+        
+        if not self.enable_favorability:
+            event.set_result(event.plain_result("好感度系统未启用"))
+            return
+        
+        chat_id = event.unified_msg_origin
+        chat_state = self._get_chat_state(chat_id)
+        
+        user_count = len(chat_state.user_favorability)
+        chat_state.user_favorability.clear()
+        chat_state.user_interaction_count.clear()
+        
+        event.set_result(event.plain_result(f"已重置当前群聊所有用户的好感度（{user_count}个用户）"))
+        logger.info(f"好感度已重置: {chat_id} ({user_count}个用户)")
+
+    # 管理员命令：手动保存好感度
+    @filter.command("heartflow_fav_save")
+    async def heartflow_favorability_save(self, event: AstrMessageEvent):
+        """手动保存好感度数据"""
+        
+        if not self.enable_favorability:
+            event.set_result(event.plain_result("好感度系统未启用"))
+            return
+        
+        try:
+            self._save_favorability()
+            
+            # 统计保存的数据
+            total_chats = 0
+            total_users = 0
+            for state in self.chat_states.values():
+                if state.user_favorability:
+                    total_chats += 1
+                    total_users += len(state.user_favorability)
+            
+            event.set_result(event.plain_result(
+                f"好感度数据已保存\n\n"
+                f"保存位置: {self.favorability_file}\n"
+                f"群聊数: {total_chats}\n"
+                f"用户数: {total_users}"
+            ))
+            logger.info(f"手动保存好感度数据: {total_chats}个群聊, {total_users}个用户")
+        except Exception as e:
+            event.set_result(event.plain_result(f"保存失败: {e}"))
+            logger.error(f"手动保存好感度失败: {e}")
+    
+    async def terminate(self):
+        """插件卸载/停用时调用，保存数据"""
+        if self.enable_favorability:
+            self._save_favorability()
+            logger.info("插件卸载，好感度数据已保存")
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
