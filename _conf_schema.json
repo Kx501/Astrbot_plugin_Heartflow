@@ -89,22 +89,22 @@
     "default": 3,
     "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次"
   },
-  "judge_prompt_template": {
-    "description": "判断提示词模板",
+  "judge_evaluation_rules": {
+    "description": "判断评估规则",
     "type": "text",
     "default": "",
-    "hint": "自定义判断提示词模板，支持变量替换：{persona_system_prompt}, {event_unified_msg_origin}, {chat_state_energy}, {minutes_since_last_reply}, {chat_context}, {context_messages_count}, {sender_name}, {message_str}, {current_time}, {reply_threshold}, {reasoning_part}。留空使用默认模板。"
+    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则。"
   },
-  "summarize_prompt_template": {
-    "description": "系统提示词总结模板",
+  "summarize_instruction": {
+    "description": "系统提示词总结指令",
     "type": "text",
     "default": "",
-    "hint": "自定义系统提示词总结模板，支持变量替换：{original_prompt}。留空使用默认模板。"
+    "hint": "自定义精简提示词，说明如何总结机器人角色设定。留空使用默认指令。"
   },
   "max_buffer_size": {
     "description": "消息缓冲区大小",
     "type": "int",
     "default": 50,
-    "hint": "每个群聊最多缓存的消息数量，用于保存完整对话历史（包括未回复的消息）。建议30-100条。"
+    "hint": "每个群聊最多缓存的消息数量，用于保存完整对话历史（包括未回复的消息）。建议15-100条。"
   }
 }
