@@ -85,8 +85,8 @@ class HeartflowPlugin(star.Star):
         self.judge_max_retries = max(0, self.config.get("judge_max_retries", 3))  # 确保最小为0
         
         # 提示词配置
-        self.judge_prompt_template = self.config.get("judge_prompt_template", "")
-        self.summarize_prompt_template = self.config.get("summarize_prompt_template", "")
+        self.judge_evaluation_rules = self.config.get("judge_evaluation_rules", "")
+        self.summarize_instruction = self.config.get("summarize_instruction", "")
         
         # 判断权重配置
         self.weights = {
@@ -160,12 +160,13 @@ class HeartflowPlugin(star.Star):
             if not judge_provider:
                 return original_prompt
             
-            # 使用配置的提示词模板，如果没有配置则使用默认模板
-            if self.summarize_prompt_template:
-                summarize_prompt = self.summarize_prompt_template.format(original_prompt=original_prompt)
+            # 使用配置的总结指令，如果没有配置则使用默认指令
+            if self.summarize_instruction:
+                instruction = self.summarize_instruction
             else:
-                summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
-总结后的内容应该在100-200字以内，突出最重要的角色特点。
+                instruction = "请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。总结后的内容应该在100-200字以内，突出最重要的角色特点。"
+            
+            summarize_prompt = f"""{instruction}
 
 原始角色设定：
 {original_prompt}
@@ -236,61 +237,22 @@ class HeartflowPlugin(star.Star):
         persona_system_prompt = await self._get_or_create_summarized_system_prompt(event, original_persona_prompt)
         logger.debug(f"小参数模型使用精简人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}")
 
-        # 构建判断上下文
-        chat_context = await self._build_chat_context(event)
-
         reasoning_part = ""
         if self.judge_include_reasoning:
             reasoning_part = ',\n    "reasoning": "详细分析原因，说明为什么应该或不应该回复，需要结合机器人角色特点进行分析，特别说明与上次回复的关联性"'
 
-        # 使用配置的提示词模板，如果没有配置则使用默认模板
-        if self.judge_prompt_template:
-            judge_prompt = self.judge_prompt_template.format(
-                persona_system_prompt=persona_system_prompt if persona_system_prompt else "默认角色：智能助手",
-                event_unified_msg_origin=event.unified_msg_origin,
-                chat_state_energy=chat_state.energy,
-                minutes_since_last_reply=self._get_minutes_since_last_reply(event.unified_msg_origin),
-                chat_context=chat_context,
-                context_messages_count=self.context_messages_count,
-                sender_name=event.get_sender_name(),
-                message_str=event.message_str,
-                current_time=datetime.datetime.now().strftime('%H:%M:%S'),
-                reply_threshold=self.reply_threshold,
-                reasoning_part=reasoning_part
-            )
+        # 使用配置的评估规则，如果没有配置则使用默认规则
+        if self.judge_evaluation_rules:
+            evaluation_rules = self.judge_evaluation_rules
         else:
-            judge_prompt = f"""
-你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
-
-注意：对话历史已经通过上下文提供给你，你可以从中了解群聊的对话流程。对话历史中：
-- [群友消息] 表示群友发送的消息
-- [我的回复] 表示机器人（我）发送的回复
-
-机器人角色设定:
-{persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
-
-当前群聊情况:
-- 群聊ID: {event.unified_msg_origin}
-- 我的精力水平: {chat_state.energy:.1f}/1.0
-- 上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
-
-群聊基本信息:
-{chat_context}
-
-待判断消息:
-发送者: {event.get_sender_name()}
-内容: {event.message_str}
-时间: {datetime.datetime.now().strftime('%H:%M:%S')}
-
-评估要求:
-请从以下5个维度评估（0-10分），重要提醒：基于上述机器人角色设定来判断是否适合回复：
+            evaluation_rules = """请从以下5个维度评估（0-10分），重要提醒：基于上述机器人角色设定来判断是否适合回复：
 
 1. 内容相关度(0-10)：消息是否有趣、有价值、适合我回复
    - 考虑消息的质量、话题性、是否需要回应
    - 识别并过滤垃圾消息、无意义内容
-   - 重要：通过上下文中的对话历史判断这条消息是否是在对我（机器人）说话，还是群友之间的对话
-   - 如果这条消息明显是在回复我上次的发言（查看[我的回复]），或者提到我，应该给高分
-   - 如果这条消息是群友之间的对话，与我无关，应该给低分
+   - 关键判断：这条消息是对我说的吗？
+     * 查看对话历史，如果消息是在回复[我的回复]，给高分
+     * 如果是群友之间的对话，与我无关，给低分
    - 结合机器人角色特点，判断是否符合角色定位
 
 2. 回复意愿(0-10)：基于当前状态，我回复此消息的意愿
@@ -307,10 +269,38 @@ class HeartflowPlugin(star.Star):
    - 考虑消息的紧急性和时效性
 
 5. 对话连贯性(0-10)：当前消息与上次机器人回复的关联程度
-   - 查看上下文中最后一个[我的回复]，判断当前消息是否与之相关
-   - 如果当前消息是对上次回复的回应或延续，应给高分
-   - 如果当前消息与上次回复完全无关，给中等分数
-   - 如果没有上次回复记录，给默认分数5分
+   - 查看对话历史中最后的[我的回复]
+   - 如果当前消息是对我上次回复的回应或延续 → 高分
+   - 如果当前消息与我上次回复无关 → 中等分数
+   - 如果对话历史中没有我的回复记录 → 默认5分"""
+
+        # 构建完整的判断提示词
+        judge_prompt = f"""
+你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
+
+重要说明：
+- 对话历史已通过上下文(contexts)参数提供，你可以查看完整的对话流程
+- [群友消息] = 群友发送的消息
+- [我的回复] = 机器人（我）发送的回复
+
+机器人角色设定:
+{persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
+
+当前群聊ID:
+{event.unified_msg_origin}
+
+机器人情况:
+我的精力水平: {chat_state.energy:.1f}/1.0
+最近活跃度: {'高' if chat_state.total_messages > 100 else '中' if chat_state.total_messages > 20 else '低'}
+上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
+历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
+
+待判断消息:
+发送者: {event.get_sender_name()}
+内容: {event.message_str}
+时间: {datetime.datetime.now().strftime('%H:%M:%S')}
+
+{evaluation_rules}
 
 回复阈值: {self.reply_threshold} (综合评分达到此分数才回复)
 
@@ -678,16 +668,6 @@ class HeartflowPlugin(star.Star):
         
         logger.info(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
         return filtered_context
-
-    async def _build_chat_context(self, event: AstrMessageEvent) -> str:
-        """构建群聊上下文"""
-        chat_state = self._get_chat_state(event.unified_msg_origin)
-
-        context_info = f"""最近活跃度: {'高' if chat_state.total_messages > 100 else '中' if chat_state.total_messages > 20 else '低'}
-历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
-当前时间: {datetime.datetime.now().strftime('%H:%M')}"""
-        return context_info
-
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
         """更新主动回复状态"""
