@@ -91,14 +91,20 @@
   },
   "judge_prompt_template": {
     "description": "判断提示词模板",
-    "type": "string",
+    "type": "text",
     "default": "",
-    "hint": "自定义判断提示词模板，支持变量替换：{persona_system_prompt}, {event_unified_msg_origin}, {chat_state_energy}, {minutes_since_last_reply}, {chat_context}, {context_messages_count}, {recent_messages}, {last_bot_reply}, {sender_name}, {message_str}, {current_time}, {reply_threshold}, {reasoning_part}。留空使用默认模板。"
+    "hint": "自定义判断提示词模板，支持变量替换：{persona_system_prompt}, {event_unified_msg_origin}, {chat_state_energy}, {minutes_since_last_reply}, {chat_context}, {context_messages_count}, {sender_name}, {message_str}, {current_time}, {reply_threshold}, {reasoning_part}。留空使用默认模板。"
   },
   "summarize_prompt_template": {
     "description": "系统提示词总结模板",
-    "type": "string",
+    "type": "text",
     "default": "",
     "hint": "自定义系统提示词总结模板，支持变量替换：{original_prompt}。留空使用默认模板。"
+  },
+  "max_buffer_size": {
+    "description": "消息缓冲区大小",
+    "type": "int",
+    "default": 50,
+    "hint": "每个群聊最多缓存的消息数量，用于保存完整对话历史（包括未回复的消息）。建议30-100条。"
   }
 }

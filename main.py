@@ -61,6 +61,22 @@ class HeartflowPlugin(star.Star):
         
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
+        
+        # ===== 消息历史缓冲机制 =====
+        # 用于保存完整的消息历史，包括未回复的消息
+        # 结构：{chat_id: [{"role": str, "content": str, "timestamp": float}]}
+        # 
+        # 为什么需要这个缓冲区？
+        # - AstrBot的conversation_manager只保存被回复的消息
+        # - 未回复的消息不会进入对话历史，导致判断时信息缺失
+        # - 通过自建缓冲区，确保小模型能看到完整的群聊历史
+        #
+        # 工作原理：
+        # 1. 用户消息：立即记录到缓冲区
+        # 2. 机器人回复：从conversation_manager同步到缓冲区
+        # 3. 判断时：优先使用缓冲区，回退到conversation_manager
+        self.message_buffer: Dict[str, list] = {}
+        self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
 
         # 判断配置
         self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
@@ -220,8 +236,6 @@ class HeartflowPlugin(star.Star):
 
         # 构建判断上下文
         chat_context = await self._build_chat_context(event)
-        recent_messages = await self._get_recent_messages(event)
-        last_bot_reply = await self._get_last_bot_reply(event)  # 新增：获取上次bot回复
 
         reasoning_part = ""
         if self.judge_include_reasoning:
@@ -236,8 +250,6 @@ class HeartflowPlugin(star.Star):
                 minutes_since_last_reply=self._get_minutes_since_last_reply(event.unified_msg_origin),
                 chat_context=chat_context,
                 context_messages_count=self.context_messages_count,
-                recent_messages=recent_messages,
-                last_bot_reply=last_bot_reply if last_bot_reply else "暂无上次回复记录",
                 sender_name=event.get_sender_name(),
                 message_str=event.message_str,
                 current_time=datetime.datetime.now().strftime('%H:%M:%S'),
@@ -247,6 +259,10 @@ class HeartflowPlugin(star.Star):
         else:
             judge_prompt = f"""
 你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
+
+注意：对话历史已经通过上下文提供给你，你可以从中了解群聊的对话流程。对话历史中：
+- [群友消息] 表示群友发送的消息
+- [我的回复] 表示机器人（我）发送的回复
 
 机器人角色设定:
 {persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
@@ -259,12 +275,6 @@ class HeartflowPlugin(star.Star):
 群聊基本信息:
 {chat_context}
 
-最近{self.context_messages_count}条对话历史:
-{recent_messages}
-
-上次机器人回复:
-{last_bot_reply if last_bot_reply else "暂无上次回复记录"}
-
 待判断消息:
 发送者: {event.get_sender_name()}
 内容: {event.message_str}
@@ -276,6 +286,9 @@ class HeartflowPlugin(star.Star):
 1. 内容相关度(0-10)：消息是否有趣、有价值、适合我回复
    - 考虑消息的质量、话题性、是否需要回应
    - 识别并过滤垃圾消息、无意义内容
+   - 重要：通过上下文中的对话历史判断这条消息是否是在对我（机器人）说话，还是群友之间的对话
+   - 如果这条消息明显是在回复我上次的发言（查看[我的回复]），或者提到我，应该给高分
+   - 如果这条消息是群友之间的对话，与我无关，应该给低分
    - 结合机器人角色特点，判断是否符合角色定位
 
 2. 回复意愿(0-10)：基于当前状态，我回复此消息的意愿
@@ -292,6 +305,7 @@ class HeartflowPlugin(star.Star):
    - 考虑消息的紧急性和时效性
 
 5. 对话连贯性(0-10)：当前消息与上次机器人回复的关联程度
+   - 查看上下文中最后一个[我的回复]，判断当前消息是否与之相关
    - 如果当前消息是对上次回复的回应或延续，应给高分
    - 如果当前消息与上次回复完全无关，给中等分数
    - 如果没有上次回复记录，给默认分数5分
@@ -406,32 +420,65 @@ class HeartflowPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群聊消息处理入口"""
+        """群聊消息处理入口
+        
+        处理流程：
+        1. 同步机器人回复（确保消息顺序正确）
+        2. 记录用户消息到缓冲区（所有消息都记录）
+        3. 检查是否需要心流判断（@和指令消息跳过）
+        4. 小模型判断是否回复
+        5. 如需回复，设置唤醒标志让AstrBot核心处理
+        """
+        
+        # === 步骤1：同步机器人回复 ===
+        # 在记录用户消息之前，先同步最新的机器人回复
+        # 这样可以确保消息的时间顺序正确
+        if self.config.get("enable_heartflow", False):
+            await self._sync_assistant_messages(event.unified_msg_origin)
 
-        # 检查基本条件
+        # === 步骤2：记录用户消息 ===
+        # 记录所有用户消息到缓冲区，包括@和指令触发的消息
+        # 这样即使不进行判断，消息也会被记录下来，保证历史完整
+        if (event.get_sender_id() != event.get_self_id() and 
+            event.message_str and event.message_str.strip() and
+            self.config.get("enable_heartflow", False)):
+            
+            user_id = event.get_sender_id()
+            user_name = event.get_sender_name()
+            # 使用与AstrBot相同的格式保存用户信息
+            message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+            self._record_message(event.unified_msg_origin, "user", message_content)
+            logger.debug(f"📝 用户消息已记录到缓冲区 | 群聊: {event.unified_msg_origin[:20]}... | 内容: {event.message_str[:30]}...")
+
+        # === 步骤3：检查是否需要心流判断 ===
+        # @和指令触发的消息不需要判断，让AstrBot核心处理
         if not self._should_process_message(event):
             return
 
         try:
-            # 小参数模型判断是否需要回复
+            # === 步骤4：小模型判断 ===
             judge_result = await self.judge_with_tiny_model(event)
 
+            # === 步骤5：根据判断结果处理 ===
             if judge_result.should_reply:
                 logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
 
-                # 设置唤醒标志为真，调用LLM
+                # 设置唤醒标志，让AstrBot核心系统处理这条消息
                 event.is_at_or_wake_command = True
                 
-                # 更新主动回复状态
+                # 更新主动回复状态（精力消耗、统计等）
                 self._update_active_state(event, judge_result)
                 logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+                
+                # 注意：机器人的回复由AstrBot核心系统生成并保存到conversation_manager
+                # 下次用户消息到来时，会在步骤1中自动同步到缓冲区
                 
                 # 不需要yield任何内容，让核心系统处理
                 return
             else:
-                # 记录被动状态
+                # 判断不需要回复，只更新被动状态
                 logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
-                self._update_passive_state(event, judge_result)
+                await self._update_passive_state(event, judge_result)
 
         except Exception as e:
             logger.error(f"心流插件处理消息异常: {e}")
@@ -495,12 +542,135 @@ class HeartflowPlugin(star.Star):
 
         return int((time.time() - chat_state.last_reply_time) / 60)
 
+    def _record_message(self, chat_id: str, role: str, content: str):
+        """记录消息到缓冲区
+        
+        Args:
+            chat_id: 群聊ID
+            role: 消息角色（user或assistant）
+            content: 消息内容
+            
+        功能：
+            - 将消息添加到指定群聊的缓冲区
+            - 自动限制缓冲区大小，防止内存无限增长
+        """
+        if chat_id not in self.message_buffer:
+            self.message_buffer[chat_id] = []
+        
+        self.message_buffer[chat_id].append({
+            "role": role,
+            "content": content,
+            "timestamp": time.time()
+        })
+        
+        # 限制缓冲区大小，只保留最近的消息
+        if len(self.message_buffer[chat_id]) > self.max_buffer_size:
+            self.message_buffer[chat_id] = self.message_buffer[chat_id][-self.max_buffer_size:]
+    
+    async def _sync_assistant_messages(self, chat_id: str):
+        """从conversation_manager同步机器人的回复消息到缓冲区
+        
+        功能：
+            - 从AstrBot的conversation_manager获取最新的机器人回复
+            - 检查该回复是否已在缓冲区中
+            - 如果是新回复，添加到缓冲区
+            
+        策略：
+            - 缓冲区为空时不同步旧消息，避免顺序错乱
+            - 只在缓冲区已有消息时同步新回复
+            - 采用"从现在开始记录"的策略
+        """
+        try:
+            # 如果缓冲区为空，说明是首次运行或刚重载插件
+            # 不同步旧消息，让缓冲区从"现在"开始记录，避免顺序问题
+            if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
+                logger.debug(f"缓冲区为空，跳过同步旧消息，从现在开始记录")
+                return
+            
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(chat_id)
+            if not curr_cid:
+                return
+
+            conversation = await self.context.conversation_manager.get_conversation(chat_id, curr_cid)
+            if not conversation or not conversation.history:
+                return
+
+            context = json.loads(conversation.history)
+            
+            # 从后往前找最后一条assistant消息
+            last_assistant_msg = None
+            for msg in reversed(context):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                
+                if role == "assistant" and content:
+                    last_assistant_msg = content
+                    break
+            
+            if not last_assistant_msg:
+                return
+            
+            # 检查缓冲区最后一条assistant消息
+            buffer_msgs = self.message_buffer[chat_id]
+            buffer_assistant_msgs = [m for m in buffer_msgs if m.get("role") == "assistant"]
+            
+            if not buffer_assistant_msgs or buffer_assistant_msgs[-1].get("content") != last_assistant_msg:
+                # 新的回复，添加到缓冲区
+                self._record_message(chat_id, "assistant", last_assistant_msg)
+                logger.debug(f"同步机器人回复到缓冲区: {last_assistant_msg[:30]}...")
+                        
+        except Exception as e:
+            logger.debug(f"同步机器人回复失败: {e}")
+    
     async def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
         """获取最近的对话上下文（用于传递给小参数模型）
         
-        注意：此方法会过滤掉函数调用相关内容，只保留纯文本消息，
-        以避免小参数模型因不支持函数调用而报错。
+        工作流程：
+            1. 优先使用插件自己的消息缓冲区（包含所有消息，包括未回复的）
+            2. 如果缓冲区为空，回退到AstrBot的conversation_manager
+            3. 为消息添加[群友消息]和[我的回复]标注，帮助小模型识别对话对象
+            
+        返回格式：
+            [
+                {"role": "user", "content": "[群友消息] ..."},
+                {"role": "assistant", "content": "[我的回复] ..."}
+            ]
+            
+        注意：
+            - 机器人回复的同步已经在on_group_message开始时完成
+            - 过滤掉函数调用等复杂内容，避免小模型报错
         """
+        chat_id = event.unified_msg_origin
+        
+        # 优先使用插件缓冲区
+        if chat_id in self.message_buffer and self.message_buffer[chat_id]:
+            buffer_messages = self.message_buffer[chat_id]
+            # 获取最近的 context_messages_count 条消息
+            recent_messages = buffer_messages[-self.context_messages_count:] if len(buffer_messages) > self.context_messages_count else buffer_messages
+            
+            filtered_context = []
+            for msg in recent_messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                
+                if role in ["user", "assistant"] and content:
+                    # 添加标注
+                    if role == "user":
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[群友消息] {content}"
+                        }
+                    else:  # assistant
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[我的回复] {content}"
+                        }
+                    filtered_context.append(clean_msg)
+            
+            logger.info(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 原始消息数: {len(buffer_messages)}")
+            return filtered_context
+        
+        # 回退到conversation_manager
         try:
             curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
             if not curr_cid:
@@ -511,25 +681,27 @@ class HeartflowPlugin(star.Star):
                 return []
 
             context = json.loads(conversation.history)
-
-            # 获取最近的 context_messages_count 条消息
             recent_context = context[-self.context_messages_count:] if len(context) > self.context_messages_count else context
 
-            # 过滤掉函数调用相关内容，避免小参数模型报错
             filtered_context = []
             for msg in recent_context:
-                # 只保留纯文本的用户和助手消息
                 role = msg.get("role", "")
                 content = msg.get("content", "")
                 
                 if role in ["user", "assistant"] and content and isinstance(content, str):
-                    # 创建一个干净的消息副本，只包含文本内容
-                    clean_msg = {
-                        "role": role,
-                        "content": content
-                    }
+                    if role == "user":
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[群友消息] {content}"
+                        }
+                    else:
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[我的回复] {content}"
+                        }
                     filtered_context.append(clean_msg)
 
+            logger.debug(f"从conversation_manager获取到 {len(filtered_context)} 条消息")
             return filtered_context
 
         except Exception as e:
@@ -545,61 +717,6 @@ class HeartflowPlugin(star.Star):
 当前时间: {datetime.datetime.now().strftime('%H:%M')}"""
         return context_info
 
-    async def _get_recent_messages(self, event: AstrMessageEvent) -> str:
-        """获取最近的消息历史（用于小参数模型判断）"""
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return "暂无对话历史"
-
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return "暂无对话历史"
-
-            context = json.loads(conversation.history)
-
-            # 获取最近的 context_messages_count 条消息
-            recent_context = context[-self.context_messages_count:] if len(context) > self.context_messages_count else context
-
-            # 直接返回原始的对话历史，让小参数模型自己判断
-            messages_text = []
-            for msg in recent_context:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                if role in ["user", "assistant"]:
-                    messages_text.append(content)
-
-            return "\n---\n".join(messages_text) if messages_text else "暂无对话历史"
-
-        except Exception as e:
-            logger.debug(f"获取消息历史失败: {e}")
-            return "暂无对话历史"
-
-    async def _get_last_bot_reply(self, event: AstrMessageEvent) -> str:
-        """获取上次机器人的回复消息"""
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return None
-
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return None
-
-            context = json.loads(conversation.history)
-
-            # 从后往前查找最后一条assistant消息
-            for msg in reversed(context):
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                if role == "assistant" and content.strip():
-                    return content
-
-            return None
-
-        except Exception as e:
-            logger.debug(f"获取上次bot回复失败: {e}")
-            return None
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
         """更新主动回复状态"""
@@ -616,8 +733,18 @@ class HeartflowPlugin(star.Star):
 
         logger.debug(f"更新主动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
 
-    def _update_passive_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
-        """更新被动状态（未回复）"""
+    async def _update_passive_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
+        """更新被动状态（未回复）
+        
+        功能：
+            - 更新消息统计
+            - 恢复精力值（不回复时精力缓慢恢复）
+            - 记录判断日志
+            
+        注意：
+            - 用户消息已经在on_group_message开始时记录到缓冲区了
+            - 这里只需要更新状态，不需要再记录消息
+        """
         chat_id = event.unified_msg_origin
         chat_state = self._get_chat_state(chat_id)
 
@@ -659,6 +786,7 @@ class HeartflowPlugin(star.Star):
 
 智能缓存:
 - 系统提示词缓存: {len(self.system_prompt_cache)} 个
+- 消息缓冲区: {len(self.message_buffer[chat_id]) if chat_id in self.message_buffer else 0}/{self.max_buffer_size} 条
 
 评分权重:
 - 内容相关度: {self.weights['relevance']:.0%}
@@ -718,6 +846,45 @@ class HeartflowPlugin(star.Star):
         
         event.set_result(event.plain_result(f"已清除 {cache_count} 个系统提示词缓存"))
         logger.info(f"系统提示词缓存已清除，共清除 {cache_count} 个缓存")
+    
+    # 管理员命令：查看消息缓冲区状态
+    @filter.command("heartflow_buffer")
+    async def heartflow_buffer_status(self, event: AstrMessageEvent):
+        """查看消息缓冲区状态"""
+        
+        chat_id = event.unified_msg_origin
+        
+        buffer_info = "消息缓冲区状态\n\n"
+        
+        if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
+            buffer_info += "当前群聊缓冲区为空"
+        else:
+            buffer = self.message_buffer[chat_id]
+            buffer_info += f"缓冲区消息数量: {len(buffer)}/{self.max_buffer_size}\n\n"
+            buffer_info += "最近10条消息:\n"
+            
+            recent_10 = buffer[-10:] if len(buffer) > 10 else buffer
+            for i, msg in enumerate(recent_10, 1):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                role_text = "群友" if role == "user" else "我"
+                buffer_info += f"{i}. [{role_text}] {content[:50]}...\n"
+        
+        event.set_result(event.plain_result(buffer_info))
+    
+    # 管理员命令：清除消息缓冲区
+    @filter.command("heartflow_buffer_clear")
+    async def heartflow_buffer_clear(self, event: AstrMessageEvent):
+        """清除当前群聊的消息缓冲区"""
+        
+        chat_id = event.unified_msg_origin
+        if chat_id in self.message_buffer:
+            msg_count = len(self.message_buffer[chat_id])
+            del self.message_buffer[chat_id]
+            event.set_result(event.plain_result(f"已清除当前群聊的消息缓冲区（{msg_count} 条消息）"))
+            logger.info(f"消息缓冲区已清除: {chat_id} ({msg_count} 条)")
+        else:
+            event.set_result(event.plain_result("当前群聊缓冲区为空，无需清除"))
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
