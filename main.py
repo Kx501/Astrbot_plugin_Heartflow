@@ -10,6 +10,7 @@ import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
+from astrbot.api.provider import LLMResponse
 
 
 @dataclass
@@ -85,13 +86,16 @@ class HeartflowPlugin(star.Star):
         # - 通过自建缓冲区，确保小模型能看到完整的群聊历史
         #
         # 工作原理：
-        # 1. 用户消息：立即记录到缓冲区
-        # 2. 机器人回复：从conversation_manager同步到缓冲区
+        # 1. 用户消息：在on_group_message中实时记录
+        # 2. 机器人回复：在on_llm_response钩子中实时记录
         # 3. 判断时：使用缓冲区的完整历史
         #
         # 注意：缓冲区采用"从现在开始记录"策略，不回溯历史
         self.message_buffer: Dict[str, list] = {}
         self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
+        
+        # 判断状态标记：用于过滤小模型的判断结果
+        self.judging_sessions: set = set()  # 正在进行判断的会话ID集合
 
         # 判断配置
         self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
@@ -263,6 +267,20 @@ class HeartflowPlugin(star.Star):
 
     async def judge_with_tiny_model(self, event: AstrMessageEvent) -> JudgeResult:
         """使用小模型进行智能判断"""
+        
+        session_id = event.unified_msg_origin
+        
+        # 标记开始判断（用于过滤小模型回复）
+        self.judging_sessions.add(session_id)
+        
+        try:
+            return await self._do_judge(event)
+        finally:
+            # 判断结束，移除标记
+            self.judging_sessions.discard(session_id)
+    
+    async def _do_judge(self, event: AstrMessageEvent) -> JudgeResult:
+        """执行判断的内部方法"""
 
         if not self.judge_provider_name:
             logger.warning("小参数判断模型提供商名称未配置，跳过心流判断")
@@ -482,20 +500,16 @@ class HeartflowPlugin(star.Star):
         """群聊消息处理入口
         
         处理流程：
-        1. 同步机器人回复（确保消息顺序正确）
-        2. 记录用户消息到缓冲区（所有消息都记录）
-        3. 检查是否需要心流判断（@和指令消息跳过）
-        4. 小模型判断是否回复
-        5. 如需回复，设置唤醒标志让AstrBot核心处理
+        1. 记录用户消息到缓冲区（所有消息都记录）
+        2. 检查是否需要心流判断（@和指令消息跳过）
+        3. 小模型判断是否回复
+        4. 如需回复，设置唤醒标志让AstrBot核心处理
+        
+        注意：机器人回复通过on_llm_response钩子实时记录
         """
         
-        # === 步骤1：同步机器人回复 ===
-        # 在记录用户消息之前，先同步最新的机器人回复
-        # 这样可以确保消息的时间顺序正确
-        if self.config.get("enable_heartflow", False):
-            await self._sync_assistant_messages(event.unified_msg_origin)
-
-        # === 步骤2：记录用户消息 ===
+        # === 步骤1：记录用户消息 ===
+        # 注意：机器人回复通过on_llm_response钩子实时记录，不需要同步
         # 记录所有用户消息到缓冲区，包括@和指令触发的消息
         # 这样即使不进行判断，消息也会被记录下来，保证历史完整
         if (event.get_sender_id() != event.get_self_id() and 
@@ -558,6 +572,51 @@ class HeartflowPlugin(star.Star):
             logger.error(f"心流插件处理消息异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+    
+    @filter.on_llm_response()
+    async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
+        """LLM回复完成时，立即记录机器人回复到缓冲区
+        
+        优势：
+        - 实时记录，不需要同步
+        - 支持连续回复（每次回复都触发）
+        - 顺序完美，不会错乱
+        
+        过滤机制：
+        - 跳过小模型判断结果（通过judging_sessions标记）
+        - 只记录群聊消息
+        - 白名单检查（如果启用）
+        """
+        if not self.config.get("enable_heartflow", False):
+            return
+        
+        try:
+            chat_id = event.unified_msg_origin
+            
+            # === 检查1：跳过小模型判断 ===
+            if chat_id in self.judging_sessions:
+                logger.debug("跳过小模型判断结果")
+                return
+            
+            # === 检查2：只记录群聊消息 ===
+            # 避免记录私聊或其他类型的消息
+            if event.message_obj.type.name != "GROUP_MESSAGE":
+                return
+            
+            # === 检查3：白名单检查 ===
+            if self.whitelist_enabled:
+                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
+                    return
+            
+            # === 记录机器人回复 ===
+            assistant_reply = resp.completion_text
+            
+            if assistant_reply and assistant_reply.strip():
+                self._record_message(chat_id, "assistant", assistant_reply)
+                logger.debug(f"📝 机器人回复已记录到缓冲区: {assistant_reply[:30]}...")
+        
+        except Exception as e:
+            logger.debug(f"记录机器人回复失败: {e}")
 
     def _should_process_message(self, event: AstrMessageEvent) -> bool:
         """检查是否应该处理这条消息"""
@@ -954,66 +1013,11 @@ class HeartflowPlugin(star.Star):
         if len(self.message_buffer[chat_id]) > self.max_buffer_size:
             self.message_buffer[chat_id] = self.message_buffer[chat_id][-self.max_buffer_size:]
     
-    async def _sync_assistant_messages(self, chat_id: str):
-        """从conversation_manager同步机器人的回复消息到缓冲区
-        
-        功能：
-            - 从AstrBot的conversation_manager获取最新的机器人回复
-            - 检查该回复是否已在缓冲区中
-            - 如果是新回复，添加到缓冲区
-            
-        策略：
-            - 缓冲区为空时不同步旧消息，避免顺序错乱
-            - 只在缓冲区已有消息时同步新回复
-            - 采用"从现在开始记录"的策略
-        """
-        try:
-            # 如果缓冲区为空，说明是首次运行或刚重载插件
-            # 不同步旧消息，让缓冲区从"现在"开始记录，避免顺序问题
-            if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
-                logger.debug(f"缓冲区为空，跳过同步旧消息，从现在开始记录")
-                return
-            
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(chat_id)
-            if not curr_cid:
-                return
-
-            conversation = await self.context.conversation_manager.get_conversation(chat_id, curr_cid)
-            if not conversation or not conversation.history:
-                return
-
-            context = json.loads(conversation.history)
-
-            # 从后往前找最后一条assistant消息
-            last_assistant_msg = None
-            for msg in reversed(context):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                
-                if role == "assistant" and content:
-                    last_assistant_msg = content
-                    break
-            
-            if not last_assistant_msg:
-                return
-            
-            # 检查缓冲区最后一条assistant消息
-            buffer_msgs = self.message_buffer[chat_id]
-            buffer_assistant_msgs = [m for m in buffer_msgs if m.get("role") == "assistant"]
-            
-            if not buffer_assistant_msgs or buffer_assistant_msgs[-1].get("content") != last_assistant_msg:
-                # 新的回复，添加到缓冲区
-                self._record_message(chat_id, "assistant", last_assistant_msg)
-                logger.debug(f"同步机器人回复到缓冲区: {last_assistant_msg[:30]}...")
-
-        except Exception as e:
-            logger.debug(f"同步机器人回复失败: {e}")
-    
     async def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
         """获取最近的对话上下文（用于传递给小参数模型）
         
         工作流程：
-            1. 使用插件自己的消息缓冲区（包含完整历史，包括未回复的消息）
+            1. 从插件的消息缓冲区获取消息（包含完整历史，包括未回复的消息）
             2. 为消息添加[群友消息]和[我的回复]标注，帮助小模型识别对话对象
             3. 返回最近N条消息（由context_messages_count配置）
             
@@ -1023,13 +1027,10 @@ class HeartflowPlugin(star.Star):
                 {"role": "assistant", "content": "[我的回复] ..."}
             ]
             
-        策略说明：
-            - 只使用缓冲区，不回退到conversation_manager
-            - 如果缓冲区为空，返回空列表（首次运行时的正常情况）
-            - 随着消息积累，缓冲区会逐渐填充完整
-            
-        注意：
-            - 机器人回复的同步已经在on_group_message开始时完成
+        消息来源：
+            - 用户消息：在on_group_message中实时记录
+            - 机器人回复：在on_llm_response钩子中实时记录
+            - 无需同步，消息都是实时添加的
         """
         chat_id = event.unified_msg_origin
         
