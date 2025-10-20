@@ -86,7 +86,6 @@ class HeartflowPlugin(star.Star):
         # 为什么需要这个缓冲区？
         # - AstrBot的conversation_manager只保存被回复的消息
         # - 未回复的消息不会进入对话历史，导致判断时信息缺失
-        # - 通过自建缓冲区，确保小模型能看到完整的群聊历史
         #
         # 工作原理：
         # 1. 用户消息：在on_group_message中实时记录
@@ -501,71 +500,42 @@ class HeartflowPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群聊消息处理入口
+        """群聊消息入口：记录消息→心流判断→设置唤醒标志"""
         
-        处理流程：
-        1. 记录用户消息到缓冲区（所有消息都记录）
-        2. 检查是否需要心流判断（@和指令消息跳过）
-        3. 小模型判断是否回复
-        4. 如需回复，设置唤醒标志让AstrBot核心处理
-        
-        注意：机器人回复通过on_llm_response钩子实时记录
-        """
-        
-        # === 步骤1：记录用户消息 ===
-        # 注意：机器人回复通过on_llm_response钩子实时记录，不需要同步
-        # 记录所有用户消息到缓冲区，包括@和指令触发的消息
-        # 这样即使不进行判断，消息也会被记录下来，保证历史完整
+        # 记录用户消息到缓冲区（包括@和指令消息，保证历史完整）
         if (event.get_sender_id() != event.get_self_id() and 
             event.message_str and event.message_str.strip() and
             self.config.get("enable_heartflow", False)):
             
             user_id = event.get_sender_id()
             user_name = event.get_sender_name()
-            # 使用与AstrBot相同的格式保存用户信息
             message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
             self._record_message(event.unified_msg_origin, "user", message_content)
-            logger.debug(f"📝 用户消息已记录到缓冲区 | 群聊: {event.unified_msg_origin[:20]}... | 内容: {event.message_str[:30]}...")
+            logger.debug(f"📝 用户消息已记录 | {event.message_str[:30]}...")
 
-        # === 步骤3：检查是否需要心流判断 ===
-        # @和指令触发的消息不需要判断，让AstrBot核心处理
+        # 检查是否需要心流判断（@和指令消息跳过）
         if not self._should_process_message(event):
             return
 
         try:
-            # === 步骤4：小模型判断 ===
             judge_result = await self.judge_with_tiny_model(event)
 
-            # === 步骤5：根据判断结果处理 ===
             if judge_result.should_reply:
-                logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
-
-                # 设置唤醒标志，让AstrBot核心系统处理这条消息
+                logger.info(f"🔥 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
                 event.is_at_or_wake_command = True
-                
-                # 更新主动回复状态（精力消耗、统计等）
                 self._update_active_state(event, judge_result)
                 
-                # 更新好感度（回复了）
                 if self.enable_favorability:
                     user_id = event.get_sender_id()
                     fav_delta = self._calculate_favorability_change(judge_result, did_reply=True)
                     self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
                     self._record_interaction(event.unified_msg_origin, user_id)
                 
-                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
-                
-                # 注意：机器人的回复由AstrBot核心系统生成并保存到conversation_manager
-                # 下次用户消息到来时，会在步骤1中自动同步到缓冲区
-                
-                # 不需要yield任何内容，让核心系统处理
                 return
             else:
-                # 判断不需要回复，只更新被动状态
-                logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
+                logger.debug(f"心流不回复 | 评分:{judge_result.overall_score:.2f}")
                 await self._update_passive_state(event, judge_result)
                 
-                # 更新好感度（没回复）
                 if self.enable_favorability:
                     user_id = event.get_sender_id()
                     fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
@@ -579,41 +549,24 @@ class HeartflowPlugin(star.Star):
     
     @filter.on_llm_request(priority=-100)
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        """LLM请求前拦截，替换为插件维护的完整对话历史
+        """LLM请求前拦截：注入完整对话历史和好感度信息
         
-        功能：
-        1. 替换 req.contexts 为插件 message_buffer 中的完整历史
-        2. 保持 system_prompt 不变（使用 AstrBot 原始的人格设定）
-        3. 包含所有消息，即使机器人没有回复过的消息
-        
-        为什么要替换：
-        - AstrBot 的 conversation_manager 只保存被回复的消息
-        - 插件维护的历史包含所有消息（包括未回复的）
-        - 让大模型能看到完整的群聊上下文
-        
-        适用范围：
-        - 所有类型的LLM请求（@触发、指令触发、主动回复等）
+        核心功能：
+        1. 替换 contexts 为插件维护的完整消息历史（包括未回复的消息）
+        2. 移除最后一条用户消息（避免与 prompt 重复）
+        3. 在 contexts 末尾插入好感度信息（最大化缓存命中率）
+        4. 保持 system_prompt 不变
         """
-        logger.info(f"🔔 on_llm_request 钩子被触发！chat_id={event.unified_msg_origin}")
         try:
-            # === 检查是否应该处理这个请求 ===
-            # 跳过小模型判断的请求（避免影响心流判断）
             chat_id = event.unified_msg_origin
+            
+            # 过滤：小模型判断、未启用心流、不在白名单
             if chat_id in self.judging_sessions:
-                logger.info("⏭️ 跳过小模型判断请求")
                 return
-            
-            # 只处理启用了心流且在白名单内的群聊
             if not self.config.get("enable_heartflow", False):
-                logger.info("⏭️ 心流未启用，跳过")
                 return
-            
-            if self.whitelist_enabled:
-                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
-                    logger.info(f"⏭️ 不在白名单内，跳过 | chat_id={chat_id}")
-                    return
-            
-            logger.info("✅ 通过所有检查，开始处理LLM请求")
+            if self.whitelist_enabled and (not self.chat_whitelist or chat_id not in self.chat_whitelist):
+                return
             
             # === 尝试替换对话历史 ===
             # 检查 req 是否有可以修改对话历史的属性
@@ -624,71 +577,27 @@ class HeartflowPlugin(star.Star):
                     break
             
             if context_attr:
-                # 获取插件维护的完整对话历史（大模型不需要标注）
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
                 
                 if plugin_contexts:
-                    # === 移除最后一条用户消息（避免与 prompt 重复）===
-                    # 因为当前用户消息会作为 req.prompt 单独传递
-                    # 所以需要从历史中移除，否则大模型会看到两次相同的消息
-                    if plugin_contexts and plugin_contexts[-1].get("role") == "user":
+                    # 移除最后一条用户消息（避免与 prompt 重复）
+                    if plugin_contexts[-1].get("role") == "user":
                         plugin_contexts = plugin_contexts[:-1]
                     
-                    # === 在最后插入好感度信息 ===
+                    # 在末尾插入好感度信息（让前面的历史消息触发API缓存）
                     if self.enable_favorability:
                         user_id = event.get_sender_id()
                         fav = self._get_user_favorability(chat_id, user_id)
                         fav_level, fav_emoji = self._get_favorability_level(fav)
                         
-                        # 构建简洁的好感度描述
-                        fav_message = {
+                        plugin_contexts.append({
                             "role": "system",
                             "content": f"你对用户(ID:{user_id})的好感度: {fav:.0f}/100 {fav_emoji} ({fav_level})"
-                        }
-                        
-                        # 追加到消息列表末尾
-                        plugin_contexts.append(fav_message)
+                        })
                     
                     # 替换对话历史
                     setattr(req, context_attr, plugin_contexts)
-                    logger.debug(f"✅ 已替换对话历史 | 属性:{context_attr} | 消息数:{len(plugin_contexts)}")
-                    
-                    # === 调试：打印发给大模型的完整请求信息 ===
-                    logger.info("=" * 80)
-                    logger.info("📤 发送给大模型的完整请求：")
-                    logger.info("")
-                    
-                    # 显示 System Prompt
-                    logger.info("【System Prompt】")
-                    if hasattr(req, 'system_prompt') and req.system_prompt:
-                        sp_lines = req.system_prompt.split('\n')
-                        for line in sp_lines[:20]:  # 只显示前20行
-                            logger.info(f"  {line}")
-                        if len(sp_lines) > 20:
-                            logger.info(f"  ... (还有 {len(sp_lines) - 20} 行)")
-                    
-                    logger.info("")
-                    
-                    # 显示对话历史
-                    logger.info("【对话历史 Contexts】")
-                    for i, msg in enumerate(plugin_contexts):
-                        role = msg.get("role", "")
-                        content = msg.get("content", "")
-                        # 限制每条消息的显示长度
-                        content_preview = content[:150] + "..." if len(content) > 150 else content
-                        logger.info(f"  [{i+1}] {role}: {content_preview}")
-                    
-                    logger.info("")
-                    
-                    # 显示当前用户消息
-                    logger.info("【当前用户消息 Prompt】")
-                    prompt_preview = req.prompt[:200] + "..." if len(req.prompt) > 200 else req.prompt
-                    logger.info(f"  {prompt_preview}")
-                    logger.info("=" * 80)
-                else:
-                    logger.debug("插件缓冲区为空，不替换对话历史")
-            else:
-                logger.warning("⚠️ ProviderRequest 不支持修改对话历史")
+                    logger.debug(f"✅ 已替换对话历史 | 消息数:{len(plugin_contexts)}")
         
         except Exception as e:
             logger.error(f"on_llm_request 钩子异常: {e}")
@@ -697,17 +606,9 @@ class HeartflowPlugin(star.Star):
     
     @filter.on_llm_response(priority=100)
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """LLM回复完成时，立即记录机器人回复到缓冲区
+        """LLM回复完成时记录机器人回复到缓冲区
         
-        优势：
-        - 实时记录，不需要同步
-        - 支持连续回复（每次回复都触发）
-        - 顺序完美，不会错乱
-        
-        过滤机制：
-        - 跳过小模型判断结果（通过judging_sessions标记）
-        - 只记录群聊消息
-        - 白名单检查（如果启用）
+        过滤：小模型判断、非群聊消息、不在白名单
         """
         if not self.config.get("enable_heartflow", False):
             return
@@ -715,30 +616,21 @@ class HeartflowPlugin(star.Star):
         try:
             chat_id = event.unified_msg_origin
             
-            # === 检查1：跳过小模型判断 ===
+            # 过滤检查
             if chat_id in self.judging_sessions:
-                logger.debug("跳过小模型判断结果")
                 return
-            
-            # === 检查2：只记录群聊消息 ===
-            # 避免记录私聊或其他类型的消息
             if event.message_obj.type.name != "GROUP_MESSAGE":
                 return
+            if self.whitelist_enabled and (not self.chat_whitelist or chat_id not in self.chat_whitelist):
+                return
             
-            # === 检查3：白名单检查 ===
-            if self.whitelist_enabled:
-                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
-                    return
-            
-            # === 记录机器人回复 ===
-            assistant_reply = resp.completion_text
-            
-            if assistant_reply and assistant_reply.strip():
-                self._record_message(chat_id, "assistant", assistant_reply)
-                logger.debug(f"📝 机器人回复已记录到缓冲区: {assistant_reply[:30]}...")
+            # 记录机器人回复
+            if resp.completion_text and resp.completion_text.strip():
+                self._record_message(chat_id, "assistant", resp.completion_text)
+                logger.debug(f"📝 机器人回复已记录: {resp.completion_text[:30]}...")
         
         except Exception as e:
-            logger.debug(f"记录机器人回复失败: {e}")
+            logger.debug(f"记录回复失败: {e}")
 
     def _should_process_message(self, event: AstrMessageEvent) -> bool:
         """检查是否应该处理这条消息"""
@@ -874,18 +766,7 @@ class HeartflowPlugin(star.Star):
     
     
     def _get_user_favorability(self, chat_id: str, user_id: str) -> float:
-        """获取用户好感度（0-100）
-        
-        优先级：
-        1. 如果启用全局好感度且满足条件，返回全局好感度
-        2. 否则返回群聊本地好感度
-        
-        全局好感度条件：
-        - enable_global_favorability = True
-        - 如果启用了白名单，当前群聊必须在白名单中
-        
-        新用户默认好感度：由initial_favorability配置（默认30）
-        """
+        """获取用户好感度：优先全局（需启用+白名单），其次本地，新用户返回初始值"""
         if not self.enable_favorability:
             return self.initial_favorability  # 系统未启用，返回初始值
         
@@ -910,10 +791,7 @@ class HeartflowPlugin(star.Star):
         return chat_state.user_interaction_count.get(user_id, 0)
     
     def _get_favorability_level(self, favorability: float) -> tuple:
-        """获取好感度等级和emoji
-        
-        返回: (等级名称, emoji)
-        """
+        """获取好感度等级和emoji，返回 (等级名称, emoji)"""
         if favorability >= 80:
             return ("挚友", "💖")
         elif favorability >= 65:
@@ -928,15 +806,7 @@ class HeartflowPlugin(star.Star):
             return ("冷淡", "😒")
     
     def _calculate_favorability_change(self, judge_result: JudgeResult, did_reply: bool) -> float:
-        """基于5个维度的归一化分数计算好感度变化
-        
-        优点：
-        - 不依赖具体分数阈值
-        - 适用于不同AI模型的评分习惯
-        - 基于相对值而非绝对值
-        
-        返回：-5.0 到 +5.0 的变化值
-        """
+        """基于5维度归一化分数计算好感度变化，返回 -5.0 到 +3.0"""
         if not self.enable_favorability:
             return 0.0
         
@@ -987,18 +857,7 @@ class HeartflowPlugin(star.Star):
         return max(-5.0, min(5.0, delta))
     
     def _update_favorability(self, chat_id: str, user_id: str, delta: float):
-        """更新用户好感度
-        
-        根据配置同时更新：
-        1. 群聊本地好感度（总是更新）
-        2. 全局好感度（如果启用且满足白名单条件）
-        
-        保存策略：插件重载/停止时保存
-        - 好感度数据仅保存在内存中
-        - 只在插件卸载/重载时通过terminate()方法保存到文件
-        - 优点：性能最佳，无IO开销
-        - 缺点：如果程序异常崩溃可能丢失自上次启动以来的所有好感度变化
-        """
+        """更新用户好感度（本地+全局），仅内存操作，插件卸载时保存到文件"""
         if not self.enable_favorability:
             return
         
@@ -1026,12 +885,7 @@ class HeartflowPlugin(star.Star):
             logger.debug(f"好感度更新: {user_id[-4:]}... | 本地:{current:.1f}→{new_value:.1f} ({delta:+.1f})")
     
     def _record_interaction(self, chat_id: str, user_id: str):
-        """记录用户互动次数
-        
-        同时更新：
-        1. 群聊本地互动计数
-        2. 全局互动计数（如果启用且满足白名单条件）
-        """
+        """记录用户互动次数（本地+全局）"""
         if not self.enable_favorability:
             return
         
@@ -1053,16 +907,11 @@ class HeartflowPlugin(star.Star):
                     self.global_interaction_count.get(user_id, 0) + 1
     
     def _apply_favorability_decay(self, chat_id: str):
-        """应用好感度自然衰减
-        
-        设计理念：
-        - 好感度会随时间自然向50（中性）回归
-        - 高好感度衰减更快（避免永久高好感）
-        - 低好感度恢复更快（给用户改过机会）
-        """
+        """每日好感度衰减：向50（中性）回归，高好感衰减快，低好感恢复快"""
         chat_state = self._get_chat_state(chat_id)
         decay_rate = self.favorability_decay_daily
         
+        # 衰减群聊本地好感度
         for user_id in list(chat_state.user_favorability.keys()):
             current = chat_state.user_favorability[user_id]
             
@@ -1074,18 +923,21 @@ class HeartflowPlugin(star.Star):
                 # 低好感度向中性恢复（恢复更快）
                 recovery = min(50 - current, decay_rate * 2.0)
                 chat_state.user_favorability[user_id] = current + recovery
+        
+        # 衰减全局好感度（如果启用）
+        if self.enable_global_favorability:
+            for user_id in list(self.global_favorability.keys()):
+                current = self.global_favorability[user_id]
+                
+                if current > 50:
+                    decay = min(current - 50, decay_rate * 1.5)
+                    self.global_favorability[user_id] = current - decay
+                elif current < 50:
+                    recovery = min(50 - current, decay_rate * 2.0)
+                    self.global_favorability[user_id] = current + recovery
     
     def _get_threshold_adjustment(self, favorability: float) -> float:
-        """根据好感度计算回复阈值调整
-        
-        使用平滑曲线，避免阈值突变
-        
-        Args:
-            favorability: 0-100
-        
-        Returns:
-            阈值调整值（-0.2 到 +0.2）
-        """
+        """根据好感度计算回复阈值调整，返回 -0.2 到 +0.2（高好感更易回复）"""
         if not self.enable_favorability:
             return 0.0
         
@@ -1101,17 +953,7 @@ class HeartflowPlugin(star.Star):
         return adjustment
 
     def _record_message(self, chat_id: str, role: str, content: str):
-        """记录消息到缓冲区
-        
-        Args:
-            chat_id: 群聊ID
-            role: 消息角色（user或assistant）
-            content: 消息内容
-            
-        功能：
-            - 将消息添加到指定群聊的缓冲区
-            - 自动限制缓冲区大小，防止内存无限增长
-        """
+        """记录消息到缓冲区，自动限制大小防止内存溢出"""
         if chat_id not in self.message_buffer:
             self.message_buffer[chat_id] = []
         
@@ -1128,27 +970,8 @@ class HeartflowPlugin(star.Star):
     async def _get_recent_contexts(self, event: AstrMessageEvent, add_labels: bool = False) -> list:
         """获取最近的对话上下文
         
-        参数：
-            event: 消息事件
-            add_labels: 是否添加[群友消息]和[我的回复]标注
-                       - True: 用于小模型判断，需要标注帮助理解
-                       - False: 用于大模型，保持原始格式（默认）
-        
-        工作流程：
-            1. 从插件的消息缓冲区获取消息（包含完整历史，包括未回复的消息）
-            2. 根据 add_labels 参数决定是否添加标注
-            3. 返回最近N条消息（由context_messages_count配置）
-            
-        返回格式：
-            [
-                {"role": "user", "content": "..."},
-                {"role": "assistant", "content": "..."}
-            ]
-            
-        消息来源：
-            - 用户消息：在on_group_message中实时记录
-            - 机器人回复：在on_llm_response钩子中实时记录
-            - 无需同步，消息都是实时添加的
+        add_labels: True=小模型（添加[群友消息]/[我的回复]标注），False=大模型（原始格式）
+        返回最近N条消息（由 context_messages_count 配置）
         """
         chat_id = event.unified_msg_origin
         
@@ -1206,17 +1029,7 @@ class HeartflowPlugin(star.Star):
         logger.debug(f"更新主动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
 
     async def _update_passive_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
-        """更新被动状态（未回复）
-        
-        功能：
-            - 更新消息统计
-            - 恢复精力值（不回复时精力缓慢恢复）
-            - 记录判断日志
-            
-        注意：
-            - 用户消息已经在on_group_message开始时记录到缓冲区了
-            - 这里只需要更新状态，不需要再记录消息
-        """
+        """更新被动状态：消息统计+1，精力缓慢恢复"""
         chat_id = event.unified_msg_origin
         chat_state = self._get_chat_state(chat_id)
 
