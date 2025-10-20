@@ -1,16 +1,19 @@
 import json
 import time
 import datetime
+
 import asyncio
 from typing import Dict
 from dataclasses import dataclass
+
 from pathlib import Path
 
 import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
+
 from astrbot.api.star import StarTools
-from astrbot.api.provider import LLMResponse
+from astrbot.api.provider import LLMResponse, ProviderRequest
 
 
 @dataclass
@@ -398,7 +401,8 @@ class HeartflowPlugin(star.Star):
 
         try:
             # 使用 provider 调用模型，传入最近的对话历史作为上下文
-            recent_contexts = await self._get_recent_contexts(event)
+            # 小模型判断需要添加标注来帮助理解对话角色
+            recent_contexts = await self._get_recent_contexts(event, add_labels=True)
 
             # 构建完整的判断提示词，将系统提示直接整合到prompt中
             complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
@@ -573,7 +577,125 @@ class HeartflowPlugin(star.Star):
             import traceback
             logger.error(traceback.format_exc())
     
-    @filter.on_llm_response()
+    @filter.on_llm_request(priority=-100)
+    async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
+        """LLM请求前拦截，替换为插件维护的完整对话历史
+        
+        功能：
+        1. 替换 req.contexts 为插件 message_buffer 中的完整历史
+        2. 保持 system_prompt 不变（使用 AstrBot 原始的人格设定）
+        3. 包含所有消息，即使机器人没有回复过的消息
+        
+        为什么要替换：
+        - AstrBot 的 conversation_manager 只保存被回复的消息
+        - 插件维护的历史包含所有消息（包括未回复的）
+        - 让大模型能看到完整的群聊上下文
+        
+        适用范围：
+        - 所有类型的LLM请求（@触发、指令触发、主动回复等）
+        """
+        logger.info(f"🔔 on_llm_request 钩子被触发！chat_id={event.unified_msg_origin}")
+        try:
+            # === 检查是否应该处理这个请求 ===
+            # 跳过小模型判断的请求（避免影响心流判断）
+            chat_id = event.unified_msg_origin
+            if chat_id in self.judging_sessions:
+                logger.info("⏭️ 跳过小模型判断请求")
+                return
+            
+            # 只处理启用了心流且在白名单内的群聊
+            if not self.config.get("enable_heartflow", False):
+                logger.info("⏭️ 心流未启用，跳过")
+                return
+            
+            if self.whitelist_enabled:
+                if not self.chat_whitelist or chat_id not in self.chat_whitelist:
+                    logger.info(f"⏭️ 不在白名单内，跳过 | chat_id={chat_id}")
+                    return
+            
+            logger.info("✅ 通过所有检查，开始处理LLM请求")
+            
+            # === 尝试替换对话历史 ===
+            # 检查 req 是否有可以修改对话历史的属性
+            context_attr = None
+            for attr in ['contexts', 'context', 'messages', 'history']:
+                if hasattr(req, attr):
+                    context_attr = attr
+                    break
+            
+            if context_attr:
+                # 获取插件维护的完整对话历史（大模型不需要标注）
+                plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
+                
+                if plugin_contexts:
+                    # === 移除最后一条用户消息（避免与 prompt 重复）===
+                    # 因为当前用户消息会作为 req.prompt 单独传递
+                    # 所以需要从历史中移除，否则大模型会看到两次相同的消息
+                    if plugin_contexts and plugin_contexts[-1].get("role") == "user":
+                        plugin_contexts = plugin_contexts[:-1]
+                    
+                    # === 在最后插入好感度信息 ===
+                    if self.enable_favorability:
+                        user_id = event.get_sender_id()
+                        fav = self._get_user_favorability(chat_id, user_id)
+                        fav_level, fav_emoji = self._get_favorability_level(fav)
+                        
+                        # 构建简洁的好感度描述
+                        fav_message = {
+                            "role": "system",
+                            "content": f"你对用户(ID:{user_id})的好感度: {fav:.0f}/100 {fav_emoji} ({fav_level})"
+                        }
+                        
+                        # 追加到消息列表末尾
+                        plugin_contexts.append(fav_message)
+                    
+                    # 替换对话历史
+                    setattr(req, context_attr, plugin_contexts)
+                    logger.debug(f"✅ 已替换对话历史 | 属性:{context_attr} | 消息数:{len(plugin_contexts)}")
+                    
+                    # === 调试：打印发给大模型的完整请求信息 ===
+                    logger.info("=" * 80)
+                    logger.info("📤 发送给大模型的完整请求：")
+                    logger.info("")
+                    
+                    # 显示 System Prompt
+                    logger.info("【System Prompt】")
+                    if hasattr(req, 'system_prompt') and req.system_prompt:
+                        sp_lines = req.system_prompt.split('\n')
+                        for line in sp_lines[:20]:  # 只显示前20行
+                            logger.info(f"  {line}")
+                        if len(sp_lines) > 20:
+                            logger.info(f"  ... (还有 {len(sp_lines) - 20} 行)")
+                    
+                    logger.info("")
+                    
+                    # 显示对话历史
+                    logger.info("【对话历史 Contexts】")
+                    for i, msg in enumerate(plugin_contexts):
+                        role = msg.get("role", "")
+                        content = msg.get("content", "")
+                        # 限制每条消息的显示长度
+                        content_preview = content[:150] + "..." if len(content) > 150 else content
+                        logger.info(f"  [{i+1}] {role}: {content_preview}")
+                    
+                    logger.info("")
+                    
+                    # 显示当前用户消息
+                    logger.info("【当前用户消息 Prompt】")
+                    prompt_preview = req.prompt[:200] + "..." if len(req.prompt) > 200 else req.prompt
+                    logger.info(f"  {prompt_preview}")
+                    logger.info("=" * 80)
+                else:
+                    logger.debug("插件缓冲区为空，不替换对话历史")
+            else:
+                logger.warning("⚠️ ProviderRequest 不支持修改对话历史")
+        
+        except Exception as e:
+            logger.error(f"on_llm_request 钩子异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    @filter.on_llm_response(priority=100)
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """LLM回复完成时，立即记录机器人回复到缓冲区
         
@@ -733,11 +855,9 @@ class HeartflowPlugin(star.Star):
             # 确保目录存在
             self.favorability_file.parent.mkdir(parents=True, exist_ok=True)
             
-            # 保存群聊好感度
+            # 保存群聊好感度（静默保存，不输出日志）
             with open(self.favorability_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            logger.debug(f"群聊好感度数据已保存，共{len(data)}个群聊")
             
             # 保存全局好感度
             if self.enable_global_favorability:
@@ -748,8 +868,6 @@ class HeartflowPlugin(star.Star):
                 
                 with open(self.global_favorability_file, 'w', encoding='utf-8') as f:
                     json.dump(global_data, f, ensure_ascii=False, indent=2)
-                
-                logger.debug(f"全局好感度数据已保存，共{len(self.global_favorability)}个用户")
 
         except Exception as e:
             logger.error(f"保存好感度数据失败: {e}")
@@ -1007,18 +1125,24 @@ class HeartflowPlugin(star.Star):
         if len(self.message_buffer[chat_id]) > self.max_buffer_size:
             self.message_buffer[chat_id] = self.message_buffer[chat_id][-self.max_buffer_size:]
     
-    async def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
-        """获取最近的对话上下文（用于传递给小参数模型）
+    async def _get_recent_contexts(self, event: AstrMessageEvent, add_labels: bool = False) -> list:
+        """获取最近的对话上下文
+        
+        参数：
+            event: 消息事件
+            add_labels: 是否添加[群友消息]和[我的回复]标注
+                       - True: 用于小模型判断，需要标注帮助理解
+                       - False: 用于大模型，保持原始格式（默认）
         
         工作流程：
             1. 从插件的消息缓冲区获取消息（包含完整历史，包括未回复的消息）
-            2. 为消息添加[群友消息]和[我的回复]标注，帮助小模型识别对话对象
+            2. 根据 add_labels 参数决定是否添加标注
             3. 返回最近N条消息（由context_messages_count配置）
             
         返回格式：
             [
-                {"role": "user", "content": "[群友消息] ..."},
-                {"role": "assistant", "content": "[我的回复] ..."}
+                {"role": "user", "content": "..."},
+                {"role": "assistant", "content": "..."}
             ]
             
         消息来源：
@@ -1043,20 +1167,27 @@ class HeartflowPlugin(star.Star):
             content = msg.get("content", "")
             
             if role in ["user", "assistant"] and content:
-                # 添加标注，帮助小模型识别对话对象
-                if role == "user":
+                if add_labels:
+                    # 为小模型添加标注，帮助识别对话对象
+                    if role == "user":
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[群友消息] {content}"
+                        }
+                    else:  # assistant
+                        clean_msg = {
+                            "role": role,
+                            "content": f"[我的回复] {content}"
+                        }
+                else:
+                    # 为大模型保持原始格式
                     clean_msg = {
                         "role": role,
-                        "content": f"[群友消息] {content}"
-                    }
-                else:  # assistant
-                    clean_msg = {
-                        "role": role,
-                        "content": f"[我的回复] {content}"
+                        "content": content
                     }
                 filtered_context.append(clean_msg)
         
-        logger.info(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
+        logger.debug(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
         return filtered_context
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
@@ -1387,7 +1518,12 @@ class HeartflowPlugin(star.Star):
         """插件卸载/停用时调用，保存数据"""
         if self.enable_favorability:
             self._save_favorability()
-            logger.info("插件卸载，好感度数据已保存")
+            
+            # 统计保存的数据
+            total_chats = sum(1 for state in self.chat_states.values() if state.user_favorability)
+            total_users = sum(len(state.user_favorability) for state in self.chat_states.values() if state.user_favorability)
+            
+            logger.info(f"💾 插件卸载，好感度数据已保存到文件 | {total_chats}个群聊, {total_users}个用户")
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
