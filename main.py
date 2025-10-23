@@ -1,6 +1,7 @@
 import json
 import time
 import datetime
+import random
 
 import asyncio
 from typing import Dict
@@ -346,13 +347,12 @@ class HeartflowPlugin(star.Star):
         # 获取好感度信息
         user_id = event.get_sender_id()
         user_fav = self._get_user_favorability(event.unified_msg_origin, user_id)
-        interaction_count = self._get_user_interaction_count(event.unified_msg_origin, user_id)
         
         # 好感度描述
         fav_info = ""
         if self.enable_favorability:
             level, emoji = self._get_favorability_level(user_fav)
-            fav_info = f"\n对当前用户的好感度: {user_fav:.0f}/100 ({level} {emoji})\n互动历史: {interaction_count}次"
+            fav_info = f"\n对当前用户的好感度: {user_fav:.0f}/100 ({level} {emoji})"
         
         # 构建完整的判断提示词
         judge_prompt = f"""
@@ -453,17 +453,23 @@ class HeartflowPlugin(star.Star):
                         continuity * self.weights["continuity"]
                     ) / 10.0
 
-                    # 应用好感度调整
-                    threshold_adjustment = self._get_threshold_adjustment(user_fav)
-                    adjusted_threshold = self.reply_threshold + threshold_adjustment
+                    # 首先判断是否达到基础阈值
+                    meets_threshold = overall_score >= self.reply_threshold
                     
-                    # 根据调整后的阈值判断是否应该回复
-                    should_reply = overall_score >= adjusted_threshold
+                    # 如果达到阈值，再根据好感度概率性决定是否回复
+                    should_reply = False
+                    reply_probability = 1.0
+                    random_roll = 0.0
                     
-                    if self.enable_favorability and abs(threshold_adjustment) > 0.01:
-                        logger.debug(f"好感度调整阈值: {self.reply_threshold:.2f} → {adjusted_threshold:.2f} (好感度:{user_fav:.0f})")
-
-                    logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
+                    if meets_threshold:
+                        reply_probability = self._calculate_reply_probability(user_fav)
+                        random_roll = random.random()
+                        should_reply = random_roll <= reply_probability
+                        
+                        if self.enable_favorability:
+                            logger.debug(f"好感度概率判定: 好感度={user_fav:.0f} | 概率={reply_probability:.2%} | 随机数={random_roll:.3f} | 结果={'通过' if should_reply else '未通过'}")
+                    else:
+                        logger.debug(f"未达到基础阈值 {self.reply_threshold:.2f}，不回复")
 
                     return JudgeResult(
                         relevance=relevance,
@@ -500,28 +506,48 @@ class HeartflowPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群聊消息入口：记录消息→心流判断→设置唤醒标志"""
+        """群聊消息入口：检查过滤→记录消息→心流判断→设置唤醒标志"""
         
-        # 记录用户消息到缓冲区（包括@和指令消息，保证历史完整）
-        if (event.get_sender_id() != event.get_self_id() and 
-            event.message_str and event.message_str.strip() and
-            self.config.get("enable_heartflow", False)):
+        # 基础检查：启用状态、白名单、非空消息
+        if not self.config.get("enable_heartflow", False):
+            return
+        
+        if self.whitelist_enabled:
+            if not self.chat_whitelist or event.unified_msg_origin not in self.chat_whitelist:
+                logger.debug(f"群聊不在白名单中，跳过处理: {event.unified_msg_origin}")
+                return
+        
+        if event.get_sender_id() == event.get_self_id():
+            return
+        
+        if not event.message_str or not event.message_str.strip():
+            return
+        
+        # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+        message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+        self._record_message(event.unified_msg_origin, "user", message_content)
+        logger.debug(f"✏️ 用户消息已记录 | {event.message_str[:30]}...")
+        
+        # 检查是否需要心流判断（@消息跳过判断，但已经被记录）
+        if event.is_at_or_wake_command:
+            logger.debug(f"跳过已被标记为唤醒的消息: {event.message_str[:30]}...")
             
-            user_id = event.get_sender_id()
-            user_name = event.get_sender_name()
-            message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
-            self._record_message(event.unified_msg_origin, "user", message_content)
-            logger.debug(f"📝 用户消息已记录 | {event.message_str[:30]}...")
-
-        # 检查是否需要心流判断（@和指令消息跳过）
-        if not self._should_process_message(event):
+            # @消息增加好感度
+            if self.enable_favorability and (not self.whitelist_enabled or event.unified_msg_origin in self.chat_whitelist):
+                user_id = event.get_sender_id()
+                self._update_favorability(event.unified_msg_origin, user_id, 0.2)
+                self._record_interaction(event.unified_msg_origin, user_id)
+                logger.debug(f"@消息好感度 +0.2")
+            
             return
 
         try:
             judge_result = await self.judge_with_tiny_model(event)
 
             if judge_result.should_reply:
-                logger.info(f"🔥 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
+                logger.info(f"❤️ 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
                 event.is_at_or_wake_command = True
                 self._update_active_state(event, judge_result)
                 
@@ -583,16 +609,17 @@ class HeartflowPlugin(star.Star):
                     # 移除最后一条用户消息（避免与 prompt 重复）
                     if plugin_contexts[-1].get("role") == "user":
                         plugin_contexts = plugin_contexts[:-1]
-                    
-                    # 在末尾插入好感度信息（让前面的历史消息触发API缓存）
+
+                    # 在消息列表开头插入好感度信息
                     if self.enable_favorability:
                         user_id = event.get_sender_id()
+                        user_name = event.get_sender_name()
                         fav = self._get_user_favorability(chat_id, user_id)
-                        fav_level, fav_emoji = self._get_favorability_level(fav)
+                        fav_level, fav_emoji= self._get_favorability_level(fav)
                         
-                        plugin_contexts.append({
-                            "role": "system",
-                            "content": f"你对用户(ID:{user_id})的好感度: {fav:.0f}/100 {fav_emoji} ({fav_level})"
+                        plugin_contexts.insert(0, {
+                            "role": "user",
+                            "content": f"（这是一条仅为你提供的内部状态更新，由系统自动插入。请根据此状态调整你的回复语气，但严禁在回复中向用户提及它。对{user_name}(ID:{user_id})的好感度: {fav:.0f}/100 {fav_level}，你只能回复这一个用户。）"
                         })
                     
                     # 替换对话历史
@@ -627,7 +654,7 @@ class HeartflowPlugin(star.Star):
             # 记录机器人回复
             if resp.completion_text and resp.completion_text.strip():
                 self._record_message(chat_id, "assistant", resp.completion_text)
-                logger.debug(f"📝 机器人回复已记录: {resp.completion_text[:30]}...")
+                logger.debug(f"✏️ 机器人回复已记录: {resp.completion_text[:30]}...")
         
         except Exception as e:
             logger.debug(f"记录回复失败: {e}")
@@ -792,11 +819,11 @@ class HeartflowPlugin(star.Star):
     
     def _get_favorability_level(self, favorability: float) -> tuple:
         """获取好感度等级和emoji，返回 (等级名称, emoji)"""
-        if favorability >= 80:
+        if favorability >= 85:
             return ("挚友", "💖")
-        elif favorability >= 65:
+        elif favorability >= 75:
             return ("好友", "😊")
-        elif favorability >= 50:
+        elif favorability >= 65:
             return ("熟人", "🙂")
         elif favorability >= 35:
             return ("普通", "😐")
@@ -936,21 +963,31 @@ class HeartflowPlugin(star.Star):
                     recovery = min(50 - current, decay_rate * 2.0)
                     self.global_favorability[user_id] = current + recovery
     
-    def _get_threshold_adjustment(self, favorability: float) -> float:
-        """根据好感度计算回复阈值调整，返回 -0.2 到 +0.2（高好感更易回复）"""
+    def _calculate_reply_probability(self, favorability: float) -> float:
+        """根据好感度计算回复概率（0.0-1.0）
+        
+        好感度与回复概率直接对应：
+        - 冷淡（0-19）  → 0-19% 概率
+        - 陌生（20-34） → 20-34% 概率
+        - 普通（35-64） → 35-64% 概率
+        - 熟人（65-74） → 65-74% 概率
+        - 好友（75-84） → 75-84% 概率
+        - 挚友（85-100）→ 85-100% 概率
+        """
         if not self.enable_favorability:
-            return 0.0
+            return 1.0  # 未启用好感度系统时，始终回复
         
-        # 归一化到 -1 到 +1
-        normalized = (favorability - 50) / 50
+        # 好感度值直接转换为概率（0-100 → 0.0-1.0）
+        base_probability = favorability / 100.0
         
-        # 使用线性映射
-        # 好感度100 → -0.2（更容易回复）
-        # 好感度50 → 0
-        # 好感度0 → +0.2（更难触发回复）
-        adjustment = -normalized * 0.2 * self.favorability_impact_strength
+        # 应用影响强度调整
+        # favorability_impact_strength = 1.0 时使用完整的好感度影响
+        # < 1.0 时减弱好感度的影响，使概率更接近1.0
+        # > 1.0 时增强好感度的影响（不推荐，会让低好感度更难回复）
+        adjusted_probability = 1.0 - (1.0 - base_probability) * self.favorability_impact_strength
         
-        return adjustment
+        # 确保概率在有效范围内
+        return max(0.0, min(1.0, adjusted_probability))
 
     def _record_message(self, chat_id: str, role: str, content: str):
         """记录消息到缓冲区，自动限制大小防止内存溢出"""
@@ -1010,7 +1047,7 @@ class HeartflowPlugin(star.Star):
                     }
                 filtered_context.append(clean_msg)
         
-        logger.debug(f"📚 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
+        logger.debug(f"⭐ 从缓冲区获取到 {len(filtered_context)} 条消息 | 缓冲区总数: {len(buffer_messages)}")
         return filtered_context
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
@@ -1208,7 +1245,7 @@ class HeartflowPlugin(star.Star):
         user_fav = self._get_user_favorability(chat_id, user_id)
         interaction_count = self._get_user_interaction_count(chat_id, user_id)
         level, emoji = self._get_favorability_level(user_fav)
-        threshold_adj = self._get_threshold_adjustment(user_fav)
+        reply_prob = self._calculate_reply_probability(user_fav)
         
         # 判断使用的是全局还是群聊好感度
         fav_source = "全局（跨群聊）" if (self.enable_global_favorability and user_id in self.global_favorability) else "当前群聊"
@@ -1225,9 +1262,9 @@ class HeartflowPlugin(star.Star):
 数据范围：{fav_source}
 
 影响效果：
-- 回复阈值调整：{threshold_adj:+.3f}
-- 实际阈值：{self.reply_threshold + threshold_adj:.3f}（原始：{self.reply_threshold}）
-- {'更容易获得回复' if threshold_adj < 0 else '更难获得回复' if threshold_adj > 0 else '无影响'}
+- 基础阈值：{self.reply_threshold:.2f}
+- 回复概率：{reply_prob:.1%}
+- 预期回复率：当消息评分达到阈值时，约{reply_prob:.1%}的消息会获得回复
 
 系统状态：
 - 好感度影响强度：{self.favorability_impact_strength}
@@ -1336,7 +1373,7 @@ class HeartflowPlugin(star.Star):
             total_chats = sum(1 for state in self.chat_states.values() if state.user_favorability)
             total_users = sum(len(state.user_favorability) for state in self.chat_states.values() if state.user_favorability)
             
-            logger.info(f"💾 插件卸载，好感度数据已保存到文件 | {total_chats}个群聊, {total_users}个用户")
+            logger.info(f"✅ 插件卸载，好感度数据已保存到文件 | {total_chats}个群聊, {total_users}个用户")
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
