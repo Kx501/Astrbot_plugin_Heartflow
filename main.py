@@ -530,39 +530,38 @@ class HeartflowPlugin(star.Star):
         if event.get_sender_id() == event.get_self_id():
             return
         
-        # 检查是否为媒体消息
-        is_media = self._is_media_message(event)
+        # 获取媒体类型，如果不是unknown则认为是媒体消息
+        media_type = self._get_media_type(event)
+        is_media = media_type != "unknown"
         
         # 处理媒体消息
         if is_media:
-            user_id = event.get_sender_id()
-            user_name = event.get_sender_name()
-            
             if self.enable_media_recognition:
                 # 识别媒体内容
                 recognized_content = await self._recognize_media_content(event)
                 if recognized_content:
                     # 识别成功，记录包含识别结果的消息
-                    message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}\n[识别结果] {recognized_content}"
+                    media_label = self._get_media_label(media_type)
+                    message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n[{media_label}] {recognized_content}"
                     self._record_message(event.unified_msg_origin, "user", message_content)
                     logger.debug(f"✏️ 媒体消息已记录并识别 | {recognized_content[:30]}...")
                 else:
                     # 识别失败，只记录原始消息
-                    message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+                    media_label = self._get_media_label(media_type)
+                    message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n[{media_label}]"
                     self._record_message(event.unified_msg_origin, "user", message_content)
-                    logger.debug(f"✏️ 媒体消息已记录（识别失败）| {event.message_str[:30]}...")
+                    logger.debug(f"✏️ 媒体消息已记录（识别失败）| {media_label[:30]}...")
             else:
-                # 未启用识别，只记录原始消息
-                message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
-                self._record_message(event.unified_msg_origin, "user", message_content)
-                logger.debug(f"✏️ 媒体消息已记录（未启用识别）| {event.message_str[:30]}...")
+                # 未启用识别，完全跳过媒体消息
+                logger.debug(f"✏️ 媒体消息已跳过（未启用识别）| {event.message_str[:30]}...")
+                return
         
         # 处理文本消息（非媒体消息）
         if not is_media:
             # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
             user_id = event.get_sender_id()
             user_name = event.get_sender_name()
-            message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+            message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
             self._record_message(event.unified_msg_origin, "user", message_content)
             logger.debug(f"✏️ 用户消息已记录 | {event.message_str[:30]}...")
         
@@ -653,15 +652,8 @@ class HeartflowPlugin(star.Star):
                 logger.debug("⚠️ 检测到AstrBot原生识图，跳过消息历史替换")
                 return
             
-            # === 尝试替换对话历史 ===
-            # 检查 req 是否有可以修改对话历史的属性
-            context_attr = None
-            for attr in ['contexts', 'context', 'messages', 'history']:
-                if hasattr(req, attr):
-                    context_attr = attr
-                    break
-            
-            if context_attr:
+            # === 替换对话历史 ===
+            if hasattr(req, 'contexts'):
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
                  
                 if plugin_contexts:
@@ -687,7 +679,7 @@ class HeartflowPlugin(star.Star):
                         })
                     
                     # 替换对话历史
-                    setattr(req, context_attr, plugin_contexts)
+                    req.contexts = plugin_contexts
                     logger.debug(f"✅ 已替换对话历史 | 消息数:{len(plugin_contexts)}")
         
         except Exception as e:
@@ -1078,22 +1070,34 @@ class HeartflowPlugin(star.Star):
 
     def _get_media_type(self, event: AstrMessageEvent) -> str:
         """解析消息内容，返回具体的媒体类型（image/audio/video/file/unknown）"""
-        if not event.message_str or not event.message_str.strip():
-            return "unknown"  # 空消息，无法确定类型
+        # 首先尝试从消息链中直接获取媒体类型
+        try:
+            message_chain = event.message_obj.message
+            for component in message_chain:
+                if hasattr(component, 'type'):
+                    if component.type == 'Image':
+                        return "image"
+                    elif component.type == 'Record':
+                        return "audio"
+                    elif component.type == 'Video':
+                        return "video"
+                    elif component.type == 'File':
+                        return "file"
+        except Exception as e:
+            logger.debug(f"从消息链获取媒体类型失败: {e}")
         
-        message_text = event.message_str.strip()
-        
-        if "[图片]" in message_text:
-            return "image"
-        elif "[语音]" in message_text:
-            return "audio"
-        elif "[视频]" in message_text:
-            return "video"
-        elif "[文件]" in message_text:
-            return "file"
-        else:
-            return "unknown"
+        logger.debug("未检测到任何媒体组件")
+        return "unknown"
 
+    def _get_media_label(self, media_type: str) -> str:
+        """根据媒体类型返回对应的中文标签"""
+        label_mapping = {
+            "image": "图片",
+            "audio": "语音", 
+            "video": "视频",
+            "file": "文件"
+        }
+        return label_mapping.get(media_type, "媒体")
 
     async def _recognize_image_content(self, event: AstrMessageEvent) -> str:
         """使用LLM模型识别图片内容，通过用户提示词设定识别要求"""
@@ -1175,33 +1179,33 @@ class HeartflowPlugin(star.Star):
             logger.error(f"获取语音识别提供商失败: {e}")
             return ""
         
+        try:
+            # 提取语音文件URL
+            audio_urls = self._extract_media_urls(event, "audio")
+            if not audio_urls:
+                logger.warning("未找到语音文件")
+                return "[语音识别失败：未找到语音]"
+            
+            logger.debug(f"尝试识别语音内容，使用STT模型: {provider}")
+            
+            # 设置媒体识别状态，防止钩子拦截
+            chat_id = event.unified_msg_origin
+            self.media_recognition_sessions.add(chat_id)
+            
             try:
-                # 提取语音文件URL
-                audio_urls = self._extract_media_urls(event, "record")
-                if not audio_urls:
-                    logger.warning("未找到语音文件")
-                    return "[语音识别失败：未找到语音]"
+                # 使用STTProvider进行语音识别
+                result = await provider.get_text(audio_urls[0])
                 
-                logger.debug(f"尝试识别语音内容，使用STT模型: {provider}")
+                logger.debug(f"语音识别结果: {result[:100]}...")
+                return result
                 
-                # 设置媒体识别状态，防止钩子拦截
-                chat_id = event.unified_msg_origin
-                self.media_recognition_sessions.add(chat_id)
-                
-                try:
-                    # 使用STTProvider进行语音识别
-                    result = await provider.get_text(audio_urls[0])
-                    
-                    logger.debug(f"语音识别结果: {result[:100]}...")
-                    return result
-                    
-                finally:
-                    # 清理媒体识别状态
-                    self.media_recognition_sessions.discard(chat_id)
-                
-            except Exception as e:
-                logger.error(f"语音识别失败: {e}")
-                return f"[语音识别失败: {str(e)}]"
+            finally:
+                # 清理媒体识别状态
+                self.media_recognition_sessions.discard(chat_id)
+            
+        except Exception as e:
+            logger.error(f"语音识别失败: {e}")
+            return f"[语音识别失败: {str(e)}]"
 
     def _extract_media_urls(self, event: AstrMessageEvent, media_type: str) -> list:
         """从消息链中提取指定类型的媒体文件URL或路径"""
@@ -1210,8 +1214,17 @@ class HeartflowPlugin(star.Star):
         try:
             message_chain = event.message_obj.message
             
+            # 将小写的媒体类型转换为大写的组件类型
+            type_mapping = {
+                "image": "Image",
+                "audio": "Record", 
+                "video": "Video",
+                "file": "File"
+            }
+            component_type = type_mapping.get(media_type, media_type)
+            
             for component in message_chain:
-                if hasattr(component, 'type') and component.type == media_type:
+                if hasattr(component, 'type') and component.type == component_type:
                     if hasattr(component, 'url') and component.url:
                         urls.append(component.url)
                     elif hasattr(component, 'file') and component.file:
@@ -1224,20 +1237,6 @@ class HeartflowPlugin(star.Star):
         
         return urls
 
-    def _is_media_message(self, event: AstrMessageEvent) -> bool:
-        """判断消息是否包含媒体内容（用于消息过滤）"""
-        if not event.message_str or not event.message_str.strip():
-            return True  # 空消息通常是媒体消息
-        
-        # 检查是否包含媒体标识
-        media_indicators = ["[图片]", "[语音]", "[视频]", "[文件]", "[表情]"]
-        message_text = event.message_str.strip()
-        
-        for indicator in media_indicators:
-            if indicator in message_text:
-                return True
-        
-        return False
 
     def _record_message(self, chat_id: str, role: str, content: str):
         """记录消息到缓冲区，自动限制大小防止内存溢出"""
