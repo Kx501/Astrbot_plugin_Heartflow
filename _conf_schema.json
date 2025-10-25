@@ -5,11 +5,41 @@
     "default": false,
     "hint": "启用后，机器人将智能判断群聊消息并主动回复"
   },
+  "enable_media_judge": {
+    "description": "启用媒体消息心流判断",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，图片、语音等媒体消息也会触发心流判断（需要先开启媒体识别）"
+  },
+  "enable_media_recognition": {
+    "description": "启用媒体内容识别",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，会自动识别图片、语音等媒体内容，并将识别结果加入对话历史"
+  },
   "judge_provider_name": {
     "description": "判断模型提供商名称",
     "type": "string",
     "default": "",
     "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商"
+  },
+  "image_recognition_provider": {
+    "description": "图片识别模型提供商名称",
+    "type": "string",
+    "default": "",
+    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型。"
+  },
+  "audio_recognition_provider": {
+    "description": "语音识别模型提供商名称",
+    "type": "string",
+    "default": "",
+    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型。"
+  },
+  "image_recognition_prompt": {
+    "description": "图片识别提示词",
+    "type": "text",
+    "default": "",
+    "hint": "图片识别的用户提示词。留空则使用默认提示词。"
   },
   "reply_threshold": {
     "description": "回复阈值(0-1)",
