@@ -2,9 +2,10 @@ import json
 import time
 import datetime
 import random
+import aiohttp
+import tempfile
 
-import asyncio
-from typing import Dict
+from typing import Dict, Optional
 from dataclasses import dataclass
 
 from pathlib import Path
@@ -84,11 +85,35 @@ class HeartflowPlugin(star.Star):
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
         
+        # 获取插件数据目录
+        try:
+            self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
+            self.favorability_file = self.data_dir / "favorability.json"
+            self.global_favorability_file = self.data_dir / "global_favorability.json"
+            logger.info(f"插件数据目录: {self.data_dir}")
+        except Exception as e:
+            logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
+            self.enable_favorability = False  # 获取路径失败，关闭好感度系统
+            self.data_dir = None
+            self.favorability_file = None
+            self.global_favorability_file = None
+        
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
         
         # 媒体识别状态：防止钩子拦截插件自身的媒体识别请求
         self.media_recognition_sessions: set = set()
+        
+        # 图片缓存目录：用于下载和检查图片文件类型
+        if self.data_dir:
+            self.image_cache_dir = self.data_dir / "image_cache"
+            self.image_cache_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # 如果数据目录不可用，禁用媒体识别功能
+            self.image_cache_dir = None
+            self.enable_media_recognition = False
+            self.enable_media_judge = False
+            logger.info("由于数据目录不可用，已自动禁用媒体识别功能")
         
         # ===== 消息历史缓冲机制 =====
         # 用于保存完整的消息历史，包括未回复的消息
@@ -112,7 +137,6 @@ class HeartflowPlugin(star.Star):
 
         # 判断配置
         self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
-        self.judge_max_retries = max(0, self.config.get("judge_max_retries", 3))  # 确保最小为0
         
         # 提示词配置
         self.judge_evaluation_rules = self.config.get("judge_evaluation_rules", "")
@@ -155,19 +179,6 @@ class HeartflowPlugin(star.Star):
             self.weights = {k: v / weight_sum for k, v in self.weights.items()}
             logger.info(f"判断权重和已归一化，当前配置为: {self.weights}")
 
-        # 获取插件数据目录
-        try:
-            self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
-            self.favorability_file = self.data_dir / "favorability.json"
-            self.global_favorability_file = self.data_dir / "global_favorability.json"
-            logger.info(f"插件数据目录: {self.data_dir}")
-        except Exception as e:
-            logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
-            self.enable_favorability = False  # 获取路径失败，关闭好感度系统
-            self.data_dir = None
-            self.favorability_file = None
-            self.global_favorability_file = None
-        
         # 加载好感度数据
         if self.enable_favorability:
             self._load_favorability()
@@ -420,95 +431,76 @@ class HeartflowPlugin(star.Star):
             complete_judge_prompt += "\n\n重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！\n\n"
             complete_judge_prompt += judge_prompt
 
-            # 重试机制：使用配置的重试次数
-            max_retries = self.judge_max_retries + 1  # 配置的次数+原始尝试=总尝试次数
-            
-            # 如果配置的重试次数为0，只尝试一次
-            if self.judge_max_retries == 0:
-                max_retries = 1
-            
-            for attempt in range(max_retries):
-                try:
-                    logger.debug(f"小参数模型判断尝试 {attempt + 1}/{max_retries}")
-                    
-                    llm_response = await judge_provider.text_chat(
-                        prompt=complete_judge_prompt,
-                        contexts=recent_contexts  # 传入最近的对话历史
-                    )
+            try:
+                logger.debug("小参数模型判断尝试")
+                
+                llm_response = await judge_provider.text_chat(
+                    prompt=complete_judge_prompt,
+                    contexts=recent_contexts  # 传入最近的对话历史
+                )
 
-                    content = llm_response.completion_text.strip()
-                    logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
+                content = llm_response.completion_text.strip()
+                logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
-                    # 尝试提取JSON
-                    if content.startswith("```json"):
-                        content = content.replace("```json", "").replace("```", "").strip()
-                    elif content.startswith("```"):
-                        content = content.replace("```", "").strip()
+                # 尝试提取JSON
+                if content.startswith("```json"):
+                    content = content.replace("```json", "").replace("```", "").strip()
+                elif content.startswith("```"):
+                    content = content.replace("```", "").strip()
 
-                    judge_data = json.loads(content)
+                judge_data = json.loads(content)
 
-                    # 直接从JSON根对象获取分数
-                    relevance = judge_data.get("relevance", 0)
-                    willingness = judge_data.get("willingness", 0)
-                    social = judge_data.get("social", 0)
-                    timing = judge_data.get("timing", 0)
-                    continuity = judge_data.get("continuity", 0)
-                    
-                    # 计算综合评分
-                    overall_score = (
-                        relevance * self.weights["relevance"] +
-                        willingness * self.weights["willingness"] +
-                        social * self.weights["social"] +
-                        timing * self.weights["timing"] +
-                        continuity * self.weights["continuity"]
-                    ) / 10.0
+                # 直接从JSON根对象获取分数
+                relevance = judge_data.get("relevance", 0)
+                willingness = judge_data.get("willingness", 0)
+                social = judge_data.get("social", 0)
+                timing = judge_data.get("timing", 0)
+                continuity = judge_data.get("continuity", 0)
+                
+                # 计算综合评分
+                overall_score = (
+                    relevance * self.weights["relevance"] +
+                    willingness * self.weights["willingness"] +
+                    social * self.weights["social"] +
+                    timing * self.weights["timing"] +
+                    continuity * self.weights["continuity"]
+                ) / 10.0
 
-                    # 首先判断是否达到基础阈值
-                    meets_threshold = overall_score >= self.reply_threshold
-                    
-                    # 如果达到阈值，再根据好感度概率性决定是否回复
-                    should_reply = False
-                    reply_probability = 1.0
-                    random_roll = 0.0
-                    
-                    if meets_threshold:
-                        reply_probability = self._calculate_reply_probability(user_fav)
-                        random_roll = random.random()
-                        should_reply = random_roll <= reply_probability
-                    
-                    if self.enable_favorability:
-                            logger.debug(f"好感度概率判定: 好感度={user_fav:.0f} | 概率={reply_probability:.2%} | 随机数={random_roll:.3f} | 结果={'通过' if should_reply else '未通过'}")
-                    else:
-                        logger.debug(f"未达到基础阈值 {self.reply_threshold:.2f}，不回复")
+                # 首先判断是否达到基础阈值
+                meets_threshold = overall_score >= self.reply_threshold
+                
+                # 如果达到阈值，再根据好感度概率性决定是否回复
+                should_reply = False
+                reply_probability = 1.0
+                random_roll = 0.0
+                
+                if meets_threshold:
+                    reply_probability = self._calculate_reply_probability(user_fav)
+                    random_roll = random.random()
+                    should_reply = random_roll <= reply_probability
+                
+                if self.enable_favorability:
+                    logger.debug(f"好感度概率判定: 好感度={user_fav:.0f} | 概率={reply_probability:.2%} | 随机数={random_roll:.3f} | 结果={'通过' if should_reply else '未通过'}")
+                else:
+                    logger.debug(f"未达到基础阈值 {self.reply_threshold:.2f}，不回复")
 
-                    return JudgeResult(
-                        relevance=relevance,
-                        willingness=willingness,
-                        social=social,
-                        timing=timing,
-                        continuity=continuity,
-                        reasoning=judge_data.get("reasoning", "") if self.judge_include_reasoning else "",
-                        should_reply=should_reply,
-                        confidence=overall_score,  # 使用综合评分作为置信度
-                        overall_score=overall_score,
-                        related_messages=[]  # 不再使用关联消息功能
-                    )
-                    
-                except json.JSONDecodeError as e:
-                    logger.warning(f"小参数模型返回JSON解析失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                    logger.warning(f"无法解析的内容: {content[:500]}...")
-                    
-                    if attempt == max_retries - 1:
-                        # 最后一次尝试失败，返回失败结果
-                        logger.error(f"小参数模型重试{self.judge_max_retries}次后仍然返回无效JSON，放弃处理")
-                        return JudgeResult(should_reply=False, reasoning=f"JSON解析失败，重试{self.judge_max_retries}次")
-                    else:
-                        # 还有重试机会，添加更强的提示
-                        complete_judge_prompt = complete_judge_prompt.replace(
-                            "重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！",
-                            f"重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！"
-                        )
-                        continue
+                return JudgeResult(
+                    relevance=relevance,
+                    willingness=willingness,
+                    social=social,
+                    timing=timing,
+                    continuity=continuity,
+                    reasoning=judge_data.get("reasoning", "") if self.judge_include_reasoning else "",
+                    should_reply=should_reply,
+                    confidence=overall_score,  # 使用综合评分作为置信度
+                    overall_score=overall_score,
+                    related_messages=[]  # 不再使用关联消息功能
+                )
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"小参数模型返回JSON解析失败: {str(e)}")
+                logger.error(f"无法解析的内容: {content[:500]}...")
+                return JudgeResult(should_reply=False, reasoning=f"JSON解析失败: {str(e)}")
 
         except Exception as e:
             logger.error(f"小参数模型判断异常: {e}")
@@ -562,6 +554,11 @@ class HeartflowPlugin(star.Star):
         
         # 处理文本消息（非媒体消息）
         if not is_media:
+            # 检查消息内容是否为空（跳过QQ表情等空消息）
+            if not event.message_str or not event.message_str.strip():
+                logger.debug(f"✏️ 跳过空消息 | {event.message_str[:30]}...")
+                return
+            
             # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
             message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
             self._record_message(event.unified_msg_origin, "user", message_content)
@@ -1101,6 +1098,52 @@ class HeartflowPlugin(star.Star):
             "file": "文件"
         }
         return label_mapping.get(media_type, "媒体")
+    
+    def _is_gif_file(self, file_path: Path) -> bool:
+        """检查文件是否为GIF格式（通过文件头判断）"""
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(6)
+                # GIF文件头：GIF87a 或 GIF89a
+                return header.startswith(b'GIF87a') or header.startswith(b'GIF89a')
+        except Exception as e:
+            logger.debug(f"检查GIF文件头失败: {e}")
+            return False
+    
+    async def _download_and_check_image(self, image_url: str) -> tuple[bool, Optional[Path]]:
+        """下载图片并检查是否为GIF，返回(是否为GIF, 文件路径)"""
+        # 如果没有缓存目录，直接返回False
+        if self.image_cache_dir is None:
+            return False, None
+            
+        try:
+            # 生成缓存文件名
+            import hashlib
+            url_hash = hashlib.md5(image_url.encode()).hexdigest()
+            cache_file = self.image_cache_dir / f"{url_hash}.img"
+            
+            # 如果缓存文件已存在，直接检查
+            if cache_file.exists():
+                is_gif = self._is_gif_file(cache_file)
+                return is_gif, cache_file
+            
+            # 下载图片
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        with open(cache_file, 'wb') as f:
+                            f.write(content)
+                        
+                        # 检查是否为GIF
+                        is_gif = self._is_gif_file(cache_file)
+                        return is_gif, cache_file
+                    else:
+                        logger.warning(f"下载图片失败，状态码: {resp.status}")
+                        return False, None
+        except Exception as e:
+            logger.error(f"下载和检查图片失败: {e}")
+            return False, None
 
     async def _recognize_image_content(self, event: AstrMessageEvent) -> str:
         """使用LLM模型识别图片内容，通过用户提示词设定识别要求"""
@@ -1133,6 +1176,13 @@ class HeartflowPlugin(star.Star):
             logger.warning("未找到图片文件")
             return "[图片识别失败：未找到图片]"
         
+        # 检查是否为GIF文件
+        image_url = image_urls[0]
+        is_gif, cache_file = await self._download_and_check_image(image_url)
+        if is_gif:
+            logger.debug("检测到GIF文件，跳过识别")
+            return "[GIF动画] 这是一个动态图片，包含动画效果"
+        
         logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
         
         # 设置媒体识别状态，防止钩子拦截
@@ -1151,7 +1201,7 @@ class HeartflowPlugin(star.Star):
             
         except Exception as e:
             logger.error(f"图片识别失败: {e}")
-            return f"[图片识别失败: {str(e)}]"
+            return "[图片识别失败]"
         finally:
             # 清理媒体识别状态
             self.media_recognition_sessions.discard(chat_id)
@@ -1206,7 +1256,7 @@ class HeartflowPlugin(star.Star):
             
         except Exception as e:
             logger.error(f"语音识别失败: {e}")
-            return f"[语音识别失败: {str(e)}]"
+            return "[语音识别失败]"
 
     def _extract_media_urls(self, event: AstrMessageEvent, media_type: str) -> list:
         """从消息链中提取指定类型的媒体文件URL或路径"""
@@ -1370,10 +1420,9 @@ class HeartflowPlugin(star.Star):
 - 回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
 
 配置参数:
-- 回复阈值: {self.reply_threshold}
-- 判断提供商: {self.judge_provider_name}
-- 最大重试次数: {self.judge_max_retries}
-- 白名单模式: {'开启' if self.whitelist_enabled else '关闭'}
+        - 回复阈值: {self.reply_threshold}
+        - 判断提供商: {self.judge_provider_name}
+        - 白名单模式: {'开启' if self.whitelist_enabled else '关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
 智能缓存:
