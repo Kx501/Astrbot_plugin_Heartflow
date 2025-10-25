@@ -65,6 +65,13 @@ class HeartflowPlugin(star.Star):
 
         # 判断模型配置
         self.judge_provider_name = self.config.get("judge_provider_name", "")
+        
+        # 媒体识别配置
+        self.enable_media_judge = self.config.get("enable_media_judge", False)
+        self.enable_media_recognition = self.config.get("enable_media_recognition", False)
+        self.image_recognition_provider_name = self.config.get("image_recognition_provider", "")
+        self.audio_recognition_provider_name = self.config.get("audio_recognition_provider", "")
+        self.image_recognition_prompt = self.config.get("image_recognition_prompt", "")
 
         # 心流参数配置
         self.reply_threshold = self.config.get("reply_threshold", 0.6)
@@ -79,6 +86,9 @@ class HeartflowPlugin(star.Star):
         
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
+        
+        # 媒体识别状态：防止钩子拦截插件自身的媒体识别请求
+        self.media_recognition_sessions: set = set()
         
         # ===== 消息历史缓冲机制 =====
         # 用于保存完整的消息历史，包括未回复的消息
@@ -465,8 +475,8 @@ class HeartflowPlugin(star.Star):
                         reply_probability = self._calculate_reply_probability(user_fav)
                         random_roll = random.random()
                         should_reply = random_roll <= reply_probability
-                        
-                        if self.enable_favorability:
+                    
+                    if self.enable_favorability:
                             logger.debug(f"好感度概率判定: 好感度={user_fav:.0f} | 概率={reply_probability:.2%} | 随机数={random_roll:.3f} | 结果={'通过' if should_reply else '未通过'}")
                     else:
                         logger.debug(f"未达到基础阈值 {self.reply_threshold:.2f}，不回复")
@@ -520,15 +530,41 @@ class HeartflowPlugin(star.Star):
         if event.get_sender_id() == event.get_self_id():
             return
         
-        if not event.message_str or not event.message_str.strip():
-            return
+        # 检查是否为媒体消息
+        is_media = self._is_media_message(event)
         
-        # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
-        message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
-        self._record_message(event.unified_msg_origin, "user", message_content)
-        logger.debug(f"✏️ 用户消息已记录 | {event.message_str[:30]}...")
+        # 处理媒体消息
+        if is_media:
+            user_id = event.get_sender_id()
+            user_name = event.get_sender_name()
+            
+            if self.enable_media_recognition:
+                # 识别媒体内容
+                recognized_content = await self._recognize_media_content(event)
+                if recognized_content:
+                    # 识别成功，记录包含识别结果的消息
+                    message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}\n[识别结果] {recognized_content}"
+                    self._record_message(event.unified_msg_origin, "user", message_content)
+                    logger.debug(f"✏️ 媒体消息已记录并识别 | {recognized_content[:30]}...")
+                else:
+                    # 识别失败，只记录原始消息
+                    message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+                    self._record_message(event.unified_msg_origin, "user", message_content)
+                    logger.debug(f"✏️ 媒体消息已记录（识别失败）| {event.message_str[:30]}...")
+            else:
+                # 未启用识别，只记录原始消息
+                message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+                self._record_message(event.unified_msg_origin, "user", message_content)
+                logger.debug(f"✏️ 媒体消息已记录（未启用识别）| {event.message_str[:30]}...")
+        
+        # 处理文本消息（非媒体消息）
+        if not is_media:
+            # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
+            user_id = event.get_sender_id()
+            user_name = event.get_sender_name()
+            message_content = f"\n[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
+            self._record_message(event.unified_msg_origin, "user", message_content)
+            logger.debug(f"✏️ 用户消息已记录 | {event.message_str[:30]}...")
         
         # 检查是否需要心流判断（@消息跳过判断，但已经被记录）
         if event.is_at_or_wake_command:
@@ -543,35 +579,42 @@ class HeartflowPlugin(star.Star):
             
             return
 
-        try:
-            judge_result = await self.judge_with_tiny_model(event)
+        # 检查是否需要心流判断
+        should_judge = True
+        if is_media and not self.enable_media_judge:
+            should_judge = False
+            logger.debug(f"媒体消息心流判断未启用，跳过判断")
+        
+        if should_judge:
+            try:
+                judge_result = await self.judge_with_tiny_model(event)
 
-            if judge_result.should_reply:
-                logger.info(f"❤️ 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
-                event.is_at_or_wake_command = True
-                self._update_active_state(event, judge_result)
-                
-                if self.enable_favorability:
-                    user_id = event.get_sender_id()
-                    fav_delta = self._calculate_favorability_change(judge_result, did_reply=True)
-                    self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
-                    self._record_interaction(event.unified_msg_origin, user_id)
-                
-                return
-            else:
-                logger.debug(f"心流不回复 | 评分:{judge_result.overall_score:.2f}")
-                await self._update_passive_state(event, judge_result)
-                
-                if self.enable_favorability:
-                    user_id = event.get_sender_id()
-                    fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
-                    self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
-                    self._record_interaction(event.unified_msg_origin, user_id)
+                if judge_result.should_reply:
+                    logger.info(f"❤️ 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
+                    event.is_at_or_wake_command = True
+                    self._update_active_state(event, judge_result)
+                    
+                    if self.enable_favorability:
+                        user_id = event.get_sender_id()
+                        fav_delta = self._calculate_favorability_change(judge_result, did_reply=True)
+                        self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
+                        self._record_interaction(event.unified_msg_origin, user_id)
+                    
+                    return
+                else:
+                    logger.debug(f"心流不回复 | 评分:{judge_result.overall_score:.2f}")
+                    await self._update_passive_state(event, judge_result)
+                    
+                    if self.enable_favorability:
+                        user_id = event.get_sender_id()
+                        fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
+                        self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
+                        self._record_interaction(event.unified_msg_origin, user_id)
 
-        except Exception as e:
-            logger.error(f"心流插件处理消息异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            except Exception as e:
+                logger.error(f"心流插件处理消息异常: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
     
     @filter.on_llm_request(priority=-100)
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -582,9 +625,16 @@ class HeartflowPlugin(star.Star):
         2. 移除最后一条用户消息（避免与 prompt 重复）
         3. 在 contexts 末尾插入好感度信息（最大化缓存命中率）
         4. 保持 system_prompt 不变
+        5. 处理AstrBot原生识图导致的重复问题
+        6. 跳过插件自身的媒体识别请求
         """
         try:
             chat_id = event.unified_msg_origin
+            
+            # 检测是否为我们自己的媒体识别请求
+            if chat_id in self.media_recognition_sessions:
+                logger.debug("🔍 检测到自身媒体识别请求，跳过钩子处理")
+                return
             
             # 过滤：小模型判断、未启用心流、不在白名单
             if chat_id in self.judging_sessions:
@@ -606,6 +656,14 @@ class HeartflowPlugin(star.Star):
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
                 
                 if plugin_contexts:
+                    # 检测AstrBot原生识图：检查系统提示词是否包含图片识别结果
+                    system_prompt = getattr(req, 'system_prompt', '') or ''
+                    
+                    # 检查系统提示词中是否包含图片识别结果的特征
+                    if 'Image Caption:' in system_prompt or 'The image depicts' in system_prompt:
+                        logger.debug("🖼️ 检测到AstrBot原生识图，跳过消息历史替换")
+                        return  # 直接返回，不进行任何替换
+                    
                     # 移除最后一条用户消息（避免与 prompt 重复）
                     if plugin_contexts[-1].get("role") == "user":
                         plugin_contexts = plugin_contexts[:-1]
@@ -617,9 +675,14 @@ class HeartflowPlugin(star.Star):
                         fav = self._get_user_favorability(chat_id, user_id)
                         fav_level, fav_emoji= self._get_favorability_level(fav)
                         
+                        # plugin_contexts.insert(0, {
+                        #     "role": "user",
+                        #     "content": f"（这是一条仅为你提供的内部状态更新，由系统自动插入。请根据此状态调整你的回复语气，但严禁在回复中向用户提及它。对{user_name}(ID:{user_id})的好感度: {fav:.0f}/100 {fav_level}，你只能回复这一个用户。）"
+                        # })
+
                         plugin_contexts.insert(0, {
                             "role": "user",
-                            "content": f"（这是一条仅为你提供的内部状态更新，由系统自动插入。请根据此状态调整你的回复语气，但严禁在回复中向用户提及它。对{user_name}(ID:{user_id})的好感度: {fav:.0f}/100 {fav_level}，你只能回复这一个用户。）"
+                            "content": f"（这是一条仅为你提供的内部状态更新，由系统自动插入。请根据此状态调整你的回复语气，但严禁向用户提及它。对最后一位用户的好感度: {fav_level}，你只能回复一位用户。）"
                         })
                     
                     # 替换对话历史
@@ -988,6 +1051,192 @@ class HeartflowPlugin(star.Star):
         
         # 确保概率在有效范围内
         return max(0.0, min(1.0, adjusted_probability))
+
+    async def _recognize_media_content(self, event: AstrMessageEvent) -> str:
+        """媒体内容识别主入口：根据媒体类型调用对应的识别方法"""
+        if not self.enable_media_recognition:
+            return ""
+        
+        # 判断媒体类型
+        media_type = self._get_media_type(event)
+        if not media_type:
+            return ""
+        
+        try:
+            if media_type == "image":
+                return await self._recognize_image_content(event)
+            elif media_type == "audio":
+                return await self._recognize_audio_content(event)
+            else:
+                logger.warning(f"不支持的媒体类型: {media_type}")
+                return ""
+            
+        except Exception as e:
+            logger.error(f"{media_type}识别失败: {e}")
+            return ""
+
+    def _get_media_type(self, event: AstrMessageEvent) -> str:
+        """解析消息内容，返回具体的媒体类型（image/audio/video/file/unknown）"""
+        if not event.message_str or not event.message_str.strip():
+            return "unknown"  # 空消息，无法确定类型
+        
+        message_text = event.message_str.strip()
+        
+        if "[图片]" in message_text:
+            return "image"
+        elif "[语音]" in message_text:
+            return "audio"
+        elif "[视频]" in message_text:
+            return "video"
+        elif "[文件]" in message_text:
+            return "file"
+        else:
+            return "unknown"
+
+
+    async def _recognize_image_content(self, event: AstrMessageEvent) -> str:
+        """使用LLM模型识别图片内容，通过用户提示词设定识别要求"""
+        chat_id = event.unified_msg_origin
+        
+        # 获取图片识别提供商
+        provider_name = self.image_recognition_provider_name or self.judge_provider_name
+        if not provider_name:
+            logger.warning("图片识别模型提供商未配置")
+            return ""
+        
+        try:
+            provider = self.context.get_provider_by_id(provider_name)
+            if not provider:
+                logger.warning(f"未找到图片识别提供商: {provider_name}")
+                return ""
+        except Exception as e:
+            logger.error(f"获取图片识别提供商失败: {e}")
+            return ""
+        
+        # 使用自定义提示词，如果为空则使用默认提示词
+        if self.image_recognition_prompt.strip():
+            prompt = self.image_recognition_prompt.strip()
+        else:
+            prompt = "Please describe the image content."
+        
+        try:
+            # 提取图片URL
+            image_urls = self._extract_media_urls(event, "image")
+            if not image_urls:
+                logger.warning("未找到图片文件")
+                return "[图片识别失败：未找到图片]"
+            
+            logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
+            
+            # 设置媒体识别状态，防止钩子拦截
+            self.media_recognition_sessions.add(chat_id)
+            
+            try:
+                # 使用provider.text_chat进行图片识别
+                llm_resp = await provider.text_chat(
+                    prompt=prompt,  # 用户提示词（必需）
+                    image_urls=image_urls,  # 传入图片URL列表
+                )
+                
+                result = llm_resp.completion_text if llm_resp.completion_text else "[图片识别失败]"
+                logger.debug(f"图片识别结果: {result[:100]}...")
+                return result
+                
+            finally:
+                # 清理媒体识别状态
+                self.media_recognition_sessions.discard(chat_id)
+            
+        except Exception as e:
+            logger.error(f"图片识别失败: {e}")
+            return f"[图片识别失败: {str(e)}]"
+
+    async def _recognize_audio_content(self, event: AstrMessageEvent) -> str:
+        """使用STT模型将语音内容转录为文字"""
+        # 获取语音识别提供商
+        provider_name = self.audio_recognition_provider_name or self.judge_provider_name
+        if not provider_name:
+            logger.warning("语音识别模型提供商未配置")
+            return ""
+        
+        try:
+            # 语音识别使用STTProvider
+            stt_providers = self.context.get_all_stt_providers()
+            provider = None
+            for p in stt_providers:
+                if p.provider_id == provider_name:
+                    provider = p
+                    break
+            
+            if not provider:
+                logger.warning(f"未找到STTProvider: {provider_name}")
+                return ""
+        except Exception as e:
+            logger.error(f"获取语音识别提供商失败: {e}")
+            return ""
+        
+            try:
+                # 提取语音文件URL
+                audio_urls = self._extract_media_urls(event, "record")
+                if not audio_urls:
+                    logger.warning("未找到语音文件")
+                    return "[语音识别失败：未找到语音]"
+                
+                logger.debug(f"尝试识别语音内容，使用STT模型: {provider}")
+                
+                # 设置媒体识别状态，防止钩子拦截
+                chat_id = event.unified_msg_origin
+                self.media_recognition_sessions.add(chat_id)
+                
+                try:
+                    # 使用STTProvider进行语音识别
+                    result = await provider.get_text(audio_urls[0])
+                    
+                    logger.debug(f"语音识别结果: {result[:100]}...")
+                    return result
+                    
+                finally:
+                    # 清理媒体识别状态
+                    self.media_recognition_sessions.discard(chat_id)
+                
+            except Exception as e:
+                logger.error(f"语音识别失败: {e}")
+                return f"[语音识别失败: {str(e)}]"
+
+    def _extract_media_urls(self, event: AstrMessageEvent, media_type: str) -> list:
+        """从消息链中提取指定类型的媒体文件URL或路径"""
+        urls = []
+        
+        try:
+            message_chain = event.message_obj.message
+            
+            for component in message_chain:
+                if hasattr(component, 'type') and component.type == media_type:
+                    if hasattr(component, 'url') and component.url:
+                        urls.append(component.url)
+                    elif hasattr(component, 'file') and component.file:
+                        urls.append(component.file)
+            
+            logger.debug(f"从消息中提取到 {len(urls)} 个{media_type}文件: {urls}")
+            
+        except Exception as e:
+            logger.error(f"提取{media_type}文件失败: {e}")
+        
+        return urls
+
+    def _is_media_message(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否包含媒体内容（用于消息过滤）"""
+        if not event.message_str or not event.message_str.strip():
+            return True  # 空消息通常是媒体消息
+        
+        # 检查是否包含媒体标识
+        media_indicators = ["[图片]", "[语音]", "[视频]", "[文件]", "[表情]"]
+        message_text = event.message_str.strip()
+        
+        for indicator in media_indicators:
+            if indicator in message_text:
+                return True
+        
+        return False
 
     def _record_message(self, chat_id: str, role: str, content: str):
         """记录消息到缓冲区，自动限制大小防止内存溢出"""
