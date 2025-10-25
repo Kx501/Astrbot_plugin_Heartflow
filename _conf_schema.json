@@ -113,12 +113,6 @@
     "default": true,
     "hint": "让小模型在判断时返回详细理由。关闭可轻微提升性能和鲁棒性。"
   },
-  "judge_max_retries": {
-    "description": "判断失败最大重试次数",
-    "type": "int",
-    "default": 3,
-    "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次"
-  },
   "judge_evaluation_rules": {
     "description": "判断评估规则",
     "type": "text",
