@@ -190,5 +190,23 @@
     "type": "float",
     "default": 0.05,
     "hint": "时机把握对好感度的影响权重，默认5%"
+  },
+  "enable_memory_system": {
+    "description": "启用智能记忆系统",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
+  },
+  "memory_summary_threshold": {
+    "description": "记忆总结触发阈值",
+    "type": "float",
+    "default": 0.8,
+    "hint": "当缓冲区使用率达到此比例时触发总结（0.8=80%）"
+  },
+  "enable_blacklist": {
+    "description": "启用智能拉黑",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，AI会根据消息内容动态判断是否需要拉黑或解封用户"
   }
 }

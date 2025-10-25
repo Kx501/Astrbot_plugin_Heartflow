@@ -3,7 +3,6 @@ import time
 import datetime
 import random
 import aiohttp
-import tempfile
 
 from typing import Dict, Optional
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ class JudgeResult:
     confidence: float = 0.0
     overall_score: float = 0.0
     related_messages: list = None
+    blacklist: str = ""  # 新增：拉黑动作 "True", "False", ""
 
     def __post_init__(self):
         if self.related_messages is None:
@@ -90,6 +90,7 @@ class HeartflowPlugin(star.Star):
             self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
             self.favorability_file = self.data_dir / "favorability.json"
             self.global_favorability_file = self.data_dir / "global_favorability.json"
+            self.blacklist_file = self.data_dir / "blacklist.json"  # 新增：拉黑状态文件
             logger.info(f"插件数据目录: {self.data_dir}")
         except Exception as e:
             logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
@@ -97,6 +98,7 @@ class HeartflowPlugin(star.Star):
             self.data_dir = None
             self.favorability_file = None
             self.global_favorability_file = None
+            self.blacklist_file = None
         
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
@@ -132,6 +134,14 @@ class HeartflowPlugin(star.Star):
         self.message_buffer: Dict[str, list] = {}
         self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
         
+        # ===== 智能记忆系统 =====
+        # 结构：{chat_id: {"summaries": [str], "last_summary_time": float}}
+        self.memory_system: Dict[str, Dict] = {}
+        
+        # ===== AI拉黑系统 =====
+        # 结构：{user_id: bool} - 简单的拉黑状态
+        self.blacklist_system: Dict[str, bool] = {}
+        
         # 判断状态标记：用于过滤小模型的判断结果
         self.judging_sessions: set = set()  # 正在进行判断的会话ID集合
 
@@ -147,7 +157,14 @@ class HeartflowPlugin(star.Star):
         self.enable_global_favorability = self.config.get("enable_global_favorability", False)
         self.favorability_impact_strength = self.config.get("favorability_impact_strength", 1.0)
         self.favorability_decay_daily = self.config.get("favorability_decay_daily", 1.0)
-        self.initial_favorability = self.config.get("initial_favorability", 10.0)  # 新用户初始好感度
+        self.initial_favorability = self.config.get("initial_favorability", 10.0)
+        
+        # 智能记忆系统配置
+        self.enable_memory_system = self.config.get("enable_memory_system", True)
+        self.memory_summary_threshold = self.config.get("memory_summary_threshold", 0.8)
+        
+        # AI拉黑系统配置
+        self.enable_blacklist = self.config.get("enable_blacklist", False)
         
         # 全局好感度存储：{user_id: favorability}
         # 跨群聊的用户好感度，不受白名单限制
@@ -183,6 +200,11 @@ class HeartflowPlugin(star.Star):
         if self.enable_favorability:
             self._load_favorability()
             logger.info("好感度保存策略: 插件重载/停止时保存")
+        
+        # 加载拉黑状态数据
+        if self.enable_blacklist:
+            self._load_blacklist()
+            logger.info("拉黑状态保存策略: 插件重载/停止时保存")
 
         logger.info("心流插件已初始化")
 
@@ -405,6 +427,11 @@ class HeartflowPlugin(star.Star):
 
 回复阈值: {self.reply_threshold} (综合评分达到此分数才回复)
 
+拉黑判断:
+- 如果用户行为极度恶劣（如恶意刷屏、攻击性言论、垃圾信息等），设置 blacklist 为 "True"
+- 如果被拉黑的用户表现改善，设置 blacklist 为 "False"
+- 正常情况下，设置 blacklist 为空字符串 ""
+
 重要！！！请严格按照以下JSON格式回复，不要添加任何其他内容：
 
 请以JSON格式回复：
@@ -413,7 +440,8 @@ class HeartflowPlugin(star.Star):
     "willingness": 分数,
     "social": 分数,
     "timing": 分数,
-    "continuity": 分数{reasoning_part}
+    "continuity": 分数{reasoning_part},
+    "blacklist": "True/False" 或 ""
 }}
 
 注意：你的回复必须是完整的JSON对象，不要包含任何解释性文字或其他内容！
@@ -494,7 +522,8 @@ class HeartflowPlugin(star.Star):
                     should_reply=should_reply,
                     confidence=overall_score,  # 使用综合评分作为置信度
                     overall_score=overall_score,
-                    related_messages=[]  # 不再使用关联消息功能
+                    related_messages=[],  # 不再使用关联消息功能
+                    blacklist=judge_data.get("blacklist", "")  # 新增：拉黑动作
                 )
                 
             except json.JSONDecodeError as e:
@@ -522,6 +551,12 @@ class HeartflowPlugin(star.Star):
         if event.get_sender_id() == event.get_self_id():
             return
         
+        # 检查用户是否被拉黑
+        user_id = event.get_sender_id()
+        if self._is_user_blacklisted(user_id):
+            logger.debug(f"用户 {user_id} 已被拉黑，跳过处理")
+            return
+        
         # 获取媒体类型，如果不是unknown则认为是媒体消息
         media_type = self._get_media_type(event)
         is_media = media_type != "unknown"
@@ -541,6 +576,10 @@ class HeartflowPlugin(star.Star):
                     message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n[{media_label}] {recognized_content}"
                     self._record_message(event.unified_msg_origin, "user", message_content)
                     logger.debug(f"✏️ 媒体消息已记录并识别 | {recognized_content[:30]}...")
+                elif recognized_content == "":
+                    # GIF文件等跳过处理的媒体，完全跳过
+                    logger.debug(f"✏️ 媒体消息已跳过（GIF等）| {event.message_str[:30]}...")
+                    return
                 else:
                     # 识别失败，只记录原始消息
                     media_label = self._get_media_label(media_type)
@@ -566,11 +605,16 @@ class HeartflowPlugin(star.Star):
         
         # 检查是否需要心流判断（@消息跳过判断，但已经被记录）
         if event.is_at_or_wake_command:
+            # 检查@消息的用户是否被拉黑
+            user_id = event.get_sender_id()
+            if self._is_user_blacklisted(user_id):
+                logger.debug(f"🚫 @消息用户被拉黑，不处理: {event.message_str[:30]}...")
+                return
+            
             logger.debug(f"跳过已被标记为唤醒的消息: {event.message_str[:30]}...")
             
             # @消息增加好感度
             if self.enable_favorability and (not self.whitelist_enabled or event.unified_msg_origin in self.chat_whitelist):
-                user_id = event.get_sender_id()
                 self._update_favorability(event.unified_msg_origin, user_id, 0.2)
                 self._record_interaction(event.unified_msg_origin, user_id)
                 logger.debug(f"@消息好感度 +0.2")
@@ -587,14 +631,37 @@ class HeartflowPlugin(star.Star):
             try:
                 judge_result = await self.judge_with_tiny_model(event)
 
-                if judge_result.should_reply:
+                # 处理拉黑动作
+                if self.enable_blacklist and judge_result.blacklist:
+                    user_id = event.get_sender_id()
+                    if judge_result.blacklist == "True":
+                        self._blacklist_user(user_id)
+                    elif judge_result.blacklist == "False":
+                        self._unblacklist_user(user_id)
+                
+                # 检查用户是否被拉黑
+                user_id = event.get_sender_id()
+                is_blacklisted = self._is_user_blacklisted(user_id)
+                
+                if judge_result.should_reply and not is_blacklisted:
                     logger.info(f"❤️ 心流触发回复 | 评分:{judge_result.overall_score:.2f}")
                     event.is_at_or_wake_command = True
                     self._update_active_state(event, judge_result)
                     
                     if self.enable_favorability:
-                        user_id = event.get_sender_id()
                         fav_delta = self._calculate_favorability_change(judge_result, did_reply=True)
+                        self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
+                        self._record_interaction(event.unified_msg_origin, user_id)
+                    
+                    return
+                    
+                elif judge_result.should_reply and is_blacklisted:
+                    logger.info(f"🚫 心流触发但用户被拉黑，不回复 | 评分:{judge_result.overall_score:.2f}")
+                    # 拉黑用户也会触发心流，但不回复，用于判断是否解封
+                    await self._update_passive_state(event, judge_result)
+                    
+                    if self.enable_favorability:
+                        fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
                         self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
                         self._record_interaction(event.unified_msg_origin, user_id)
                     
@@ -605,7 +672,6 @@ class HeartflowPlugin(star.Star):
                     await self._update_passive_state(event, judge_result)
                     
                     if self.enable_favorability:
-                        user_id = event.get_sender_id()
                         fav_delta = self._calculate_favorability_change(judge_result, did_reply=False)
                         self._update_favorability(event.unified_msg_origin, user_id, fav_delta)
                         self._record_interaction(event.unified_msg_origin, user_id)
@@ -846,6 +912,51 @@ class HeartflowPlugin(star.Star):
 
         except Exception as e:
             logger.error(f"保存好感度数据失败: {e}")
+    
+    def _load_blacklist(self):
+        """从文件加载拉黑状态数据"""
+        if not self.blacklist_file or not self.blacklist_file.exists():
+            logger.info("拉黑状态文件不存在，使用默认空状态")
+            return
+        
+        try:
+            with open(self.blacklist_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.blacklist_system = data.get("blacklist_system", {})
+                
+            blacklist_count = sum(1 for blacklisted in self.blacklist_system.values() if blacklisted)
+            logger.info(f"已加载拉黑状态: {len(self.blacklist_system)}个用户记录, {blacklist_count}个被拉黑")
+            
+        except Exception as e:
+            logger.error(f"加载拉黑状态失败: {e}")
+            self.blacklist_system = {}
+    
+    def _save_blacklist(self):
+        """保存拉黑状态数据到文件"""
+        if not self.blacklist_file:
+            logger.warning("拉黑状态文件路径未设置，跳过保存")
+            return
+        
+        try:
+            # 确保目录存在
+            self.blacklist_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 构建保存数据
+            data = {
+                "blacklist_system": self.blacklist_system,
+                "save_time": time.time(),
+                "save_time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            }
+            
+            # 保存到文件
+            with open(self.blacklist_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            blacklist_count = sum(1 for blacklisted in self.blacklist_system.values() if blacklisted)
+            logger.info(f"拉黑状态已保存: {len(self.blacklist_system)}个用户记录, {blacklist_count}个被拉黑")
+            
+        except Exception as e:
+            logger.error(f"保存拉黑状态失败: {e}")
     
     
     def _get_user_favorability(self, chat_id: str, user_id: str) -> float:
@@ -1168,7 +1279,7 @@ class HeartflowPlugin(star.Star):
         if self.image_recognition_prompt.strip():
             prompt = self.image_recognition_prompt.strip()
         else:
-            prompt = "Please describe the image content."
+            prompt = "请使用中文描述图片内容"
         
         # 提取图片URL
         image_urls = self._extract_media_urls(event, "image")
@@ -1180,8 +1291,8 @@ class HeartflowPlugin(star.Star):
         image_url = image_urls[0]
         is_gif, cache_file = await self._download_and_check_image(image_url)
         if is_gif:
-            logger.debug("检测到GIF文件，跳过识别")
-            return "[GIF动画] 这是一个动态图片，包含动画效果"
+            logger.debug("检测到GIF文件，跳过识别和心流判断")
+            return ""  # 返回空字符串，表示跳过处理
         
         logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
         
@@ -1290,7 +1401,7 @@ class HeartflowPlugin(star.Star):
 
 
     def _record_message(self, chat_id: str, role: str, content: str):
-        """记录消息到缓冲区，自动限制大小防止内存溢出"""
+        """记录消息到缓冲区，自动限制大小防止内存溢出，并触发智能总结"""
         if chat_id not in self.message_buffer:
             self.message_buffer[chat_id] = []
         
@@ -1300,9 +1411,147 @@ class HeartflowPlugin(star.Star):
             "timestamp": time.time()
         })
         
-        # 限制缓冲区大小，只保留最近的消息
-        if len(self.message_buffer[chat_id]) > self.max_buffer_size:
-            self.message_buffer[chat_id] = self.message_buffer[chat_id][-self.max_buffer_size:]
+        # 检查是否需要触发智能总结
+        if self.enable_memory_system:
+            self._check_and_trigger_memory_summary(chat_id)
+        
+    def _check_and_trigger_memory_summary(self, chat_id: str):
+        """检查是否需要触发智能总结"""
+        if chat_id not in self.message_buffer:
+            return
+            
+        buffer_size = len(self.message_buffer[chat_id])
+        threshold = int(self.max_buffer_size * self.memory_summary_threshold)
+        
+        if buffer_size >= threshold:
+            # 异步触发总结，不阻塞主流程
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 如果事件循环正在运行，创建任务
+                    asyncio.create_task(self._create_memory_summary(chat_id))
+                else:
+                    # 如果事件循环未运行，直接运行
+                    asyncio.run(self._create_memory_summary(chat_id))
+            except Exception as e:
+                logger.error(f"触发智能总结失败: {e}")
+    
+    async def _create_memory_summary(self, chat_id: str):
+        """创建记忆总结"""
+        try:
+            if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
+                return
+                
+            # 获取需要总结的消息（前70%的消息）
+            messages_to_summarize = self.message_buffer[chat_id][:int(len(self.message_buffer[chat_id]) * 0.7)]
+            
+            if len(messages_to_summarize) < 5:  # 消息太少，不总结
+                return
+                
+            # 构建总结提示词
+            summary_prompt = self._build_summary_prompt(messages_to_summarize)
+            
+            # 调用AI进行总结
+            summary = await self._call_ai_for_summary(summary_prompt)
+            
+            if summary:
+                # 保存总结到记忆系统
+                if chat_id not in self.memory_system:
+                    self.memory_system[chat_id] = {"summaries": [], "last_summary_time": 0}
+                
+                self.memory_system[chat_id]["summaries"].append(summary)
+                self.memory_system[chat_id]["last_summary_time"] = time.time()
+                
+                # 保留最近10个总结，避免内存过多
+                if len(self.memory_system[chat_id]["summaries"]) > 10:
+                    self.memory_system[chat_id]["summaries"] = self.memory_system[chat_id]["summaries"][-10:]
+                
+                # 从缓冲区中移除已总结的消息，保留最近30%
+                keep_count = int(len(self.message_buffer[chat_id]) * 0.3)
+                self.message_buffer[chat_id] = self.message_buffer[chat_id][-keep_count:]
+                
+                logger.info(f"群聊 {chat_id} 完成智能总结，保留 {keep_count} 条最新消息")
+                
+        except Exception as e:
+            logger.error(f"创建记忆总结失败: {e}")
+    
+    def _build_summary_prompt(self, messages: list) -> str:
+        """构建总结提示词"""
+        prompt = """请总结以下群聊对话的关键信息。要求：
+
+1. **客观记录**：如实记录对话内容，包括话题转换和用户行为
+2. **重点提取**：识别主要话题、重要事件、用户关系变化
+3. **行为分析**：注意用户的行为模式，包括正常交流和不当言论
+4. **简洁明了**：用简洁的语言概括，保留关键信息
+
+对话内容：
+"""
+        
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", 0)
+            
+            # 格式化时间
+            time_str = time.strftime("%H:%M", time.localtime(timestamp))
+            
+            if role == "user":
+                prompt += f"[{time_str}] 用户: {content}\n"
+            elif role == "assistant":
+                prompt += f"[{time_str}] 机器人: {content}\n"
+        
+        prompt += "\n请提供客观、简洁的总结："
+        return prompt
+    
+    async def _call_ai_for_summary(self, prompt: str) -> str:
+        """调用AI进行总结"""
+        try:
+            # 使用判断模型进行总结
+            provider = self.context.provider_manager.get_provider(self.judge_provider_name)
+            if not provider:
+                logger.error(f"找不到判断模型提供商: {self.judge_provider_name}")
+                return ""
+            
+            # 构建消息
+            messages = [{"role": "user", "content": prompt}]
+            
+            # 调用AI
+            result = await provider.text_chat(messages, max_tokens=500)
+            
+            if result and result.content:
+                return result.content.strip()
+            else:
+                logger.error("AI总结返回空结果")
+                return ""
+                
+        except Exception as e:
+            logger.error(f"调用AI总结失败: {e}")
+            return ""
+    
+    def _is_user_blacklisted(self, user_id: str) -> bool:
+        """检查用户是否被拉黑"""
+        if not self.enable_blacklist:
+            return False
+        return self.blacklist_system.get(user_id, False)
+    
+    def _blacklist_user(self, user_id: str):
+        """拉黑用户"""
+        if not self.enable_blacklist:
+            return
+        self.blacklist_system[user_id] = True
+        logger.warning(f"用户 {user_id} 已被AI拉黑")
+        # 自动保存拉黑状态
+        self._save_blacklist()
+    
+    def _unblacklist_user(self, user_id: str):
+        """解封用户"""
+        if not self.enable_blacklist:
+            return
+        self.blacklist_system[user_id] = False
+        logger.info(f"用户 {user_id} 已被AI解封")
+        # 自动保存拉黑状态
+        self._save_blacklist()
     
     async def _get_recent_contexts(self, event: AstrMessageEvent, add_labels: bool = False) -> list:
         """获取最近的对话上下文
@@ -1663,6 +1912,52 @@ class HeartflowPlugin(star.Star):
             event.set_result(event.plain_result(f"保存失败: {e}"))
             logger.error(f"手动保存好感度失败: {e}")
     
+    # AI拉黑系统管理命令
+    @filter.command("heartflow_blacklist_status")
+    async def heartflow_blacklist_status(self, event: AstrMessageEvent):
+        """查看拉黑系统状态"""
+        
+        if not self.enable_blacklist:
+            event.set_result(event.plain_result("AI拉黑系统未启用"))
+            return
+        
+        blacklist_count = sum(1 for blacklisted in self.blacklist_system.values() if blacklisted)
+        
+        result = f"🤖 AI拉黑系统状态\n\n"
+        result += f"系统状态: {'启用' if self.enable_blacklist else '禁用'}\n"
+        result += f"当前拉黑用户数: {blacklist_count}\n\n"
+        
+        if blacklist_count > 0:
+            result += "被拉黑用户:\n"
+            for user_id, blacklisted in self.blacklist_system.items():
+                if blacklisted:
+                    result += f"- {user_id}\n"
+        
+        event.set_result(event.plain_result(result))
+    
+    @filter.command("heartflow_unblacklist")
+    async def heartflow_unblacklist(self, event: AstrMessageEvent):
+        """手动解封用户"""
+        
+        if not self.enable_blacklist:
+            event.set_result(event.plain_result("AI拉黑系统未启用"))
+            return
+        
+        # 解析命令参数
+        args = event.message_str.split()
+        if len(args) < 2:
+            event.set_result(event.plain_result("用法: /heartflow_unblacklist <用户ID>"))
+            return
+        
+        user_id = args[1]
+        
+        if user_id not in self.blacklist_system or not self.blacklist_system[user_id]:
+            event.set_result(event.plain_result(f"用户 {user_id} 未被拉黑"))
+            return
+        
+        self._unblacklist_user(user_id)
+        event.set_result(event.plain_result(f"用户 {user_id} 已解封"))
+    
     async def terminate(self):
         """插件卸载/停用时调用，保存数据"""
         if self.enable_favorability:
@@ -1673,6 +1968,14 @@ class HeartflowPlugin(star.Star):
             total_users = sum(len(state.user_favorability) for state in self.chat_states.values() if state.user_favorability)
             
             logger.info(f"✅ 插件卸载，好感度数据已保存到文件 | {total_chats}个群聊, {total_users}个用户")
+        
+        if self.enable_blacklist:
+            self._save_blacklist()
+            
+            # 统计保存的数据
+            blacklist_count = sum(1 for blacklisted in self.blacklist_system.values() if blacklisted)
+            
+            logger.info(f"✅ 插件卸载，拉黑状态已保存到文件 | {len(self.blacklist_system)}个用户记录, {blacklist_count}个被拉黑")
 
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
