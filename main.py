@@ -644,6 +644,15 @@ class HeartflowPlugin(star.Star):
             if self.whitelist_enabled and (not self.chat_whitelist or chat_id not in self.chat_whitelist):
                 return
             
+            # === 检测AstrBot原生识图 ===
+            # 检测AstrBot原生识图：检查系统提示词是否包含图片识别结果
+            system_prompt = getattr(req, 'system_prompt', '') or ''
+            
+            # 主要检测特征：Image Caption:（AstrBot原生识图的主要标识）
+            if 'Image Caption:' in system_prompt:
+                logger.debug("⚠️ 检测到AstrBot原生识图，跳过消息历史替换")
+                return
+            
             # === 尝试替换对话历史 ===
             # 检查 req 是否有可以修改对话历史的属性
             context_attr = None
@@ -654,16 +663,8 @@ class HeartflowPlugin(star.Star):
             
             if context_attr:
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
-                
+                 
                 if plugin_contexts:
-                    # 检测AstrBot原生识图：检查系统提示词是否包含图片识别结果
-                    system_prompt = getattr(req, 'system_prompt', '') or ''
-                    
-                    # 检查系统提示词中是否包含图片识别结果的特征
-                    if 'Image Caption:' in system_prompt or 'The image depicts' in system_prompt:
-                        logger.debug("🖼️ 检测到AstrBot原生识图，跳过消息历史替换")
-                        return  # 直接返回，不进行任何替换
-                    
                     # 移除最后一条用户消息（避免与 prompt 重复）
                     if plugin_contexts[-1].get("role") == "user":
                         plugin_contexts = plugin_contexts[:-1]
