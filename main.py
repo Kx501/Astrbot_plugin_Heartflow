@@ -2,9 +2,10 @@ import json
 import time
 import datetime
 import random
+import aiohttp
+import tempfile
 
-import asyncio
-from typing import Dict
+from typing import Dict, Optional
 from dataclasses import dataclass
 
 from pathlib import Path
@@ -84,11 +85,35 @@ class HeartflowPlugin(star.Star):
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
         
+        # 获取插件数据目录
+        try:
+            self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
+            self.favorability_file = self.data_dir / "favorability.json"
+            self.global_favorability_file = self.data_dir / "global_favorability.json"
+            logger.info(f"插件数据目录: {self.data_dir}")
+        except Exception as e:
+            logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
+            self.enable_favorability = False  # 获取路径失败，关闭好感度系统
+            self.data_dir = None
+            self.favorability_file = None
+            self.global_favorability_file = None
+        
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
         
         # 媒体识别状态：防止钩子拦截插件自身的媒体识别请求
         self.media_recognition_sessions: set = set()
+        
+        # 图片缓存目录：用于下载和检查图片文件类型
+        if self.data_dir:
+            self.image_cache_dir = self.data_dir / "image_cache"
+            self.image_cache_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # 如果数据目录不可用，禁用媒体识别功能
+            self.image_cache_dir = None
+            self.enable_media_recognition = False
+            self.enable_media_judge = False
+            logger.info("由于数据目录不可用，已自动禁用媒体识别功能")
         
         # ===== 消息历史缓冲机制 =====
         # 用于保存完整的消息历史，包括未回复的消息
@@ -154,19 +179,6 @@ class HeartflowPlugin(star.Star):
             self.weights = {k: v / weight_sum for k, v in self.weights.items()}
             logger.info(f"判断权重和已归一化，当前配置为: {self.weights}")
 
-        # 获取插件数据目录
-        try:
-            self.data_dir = StarTools.get_data_dir(None)  # 自动检测插件名称
-            self.favorability_file = self.data_dir / "favorability.json"
-            self.global_favorability_file = self.data_dir / "global_favorability.json"
-            logger.info(f"插件数据目录: {self.data_dir}")
-        except Exception as e:
-            logger.error(f"获取数据目录失败，好感度系统已禁用: {e}")
-            self.enable_favorability = False  # 获取路径失败，关闭好感度系统
-            self.data_dir = None
-            self.favorability_file = None
-            self.global_favorability_file = None
-        
         # 加载好感度数据
         if self.enable_favorability:
             self._load_favorability()
@@ -1086,6 +1098,52 @@ class HeartflowPlugin(star.Star):
             "file": "文件"
         }
         return label_mapping.get(media_type, "媒体")
+    
+    def _is_gif_file(self, file_path: Path) -> bool:
+        """检查文件是否为GIF格式（通过文件头判断）"""
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(6)
+                # GIF文件头：GIF87a 或 GIF89a
+                return header.startswith(b'GIF87a') or header.startswith(b'GIF89a')
+        except Exception as e:
+            logger.debug(f"检查GIF文件头失败: {e}")
+            return False
+    
+    async def _download_and_check_image(self, image_url: str) -> tuple[bool, Optional[Path]]:
+        """下载图片并检查是否为GIF，返回(是否为GIF, 文件路径)"""
+        # 如果没有缓存目录，直接返回False
+        if self.image_cache_dir is None:
+            return False, None
+            
+        try:
+            # 生成缓存文件名
+            import hashlib
+            url_hash = hashlib.md5(image_url.encode()).hexdigest()
+            cache_file = self.image_cache_dir / f"{url_hash}.img"
+            
+            # 如果缓存文件已存在，直接检查
+            if cache_file.exists():
+                is_gif = self._is_gif_file(cache_file)
+                return is_gif, cache_file
+            
+            # 下载图片
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        with open(cache_file, 'wb') as f:
+                            f.write(content)
+                        
+                        # 检查是否为GIF
+                        is_gif = self._is_gif_file(cache_file)
+                        return is_gif, cache_file
+                    else:
+                        logger.warning(f"下载图片失败，状态码: {resp.status}")
+                        return False, None
+        except Exception as e:
+            logger.error(f"下载和检查图片失败: {e}")
+            return False, None
 
     async def _recognize_image_content(self, event: AstrMessageEvent) -> str:
         """使用LLM模型识别图片内容，通过用户提示词设定识别要求"""
@@ -1117,6 +1175,13 @@ class HeartflowPlugin(star.Star):
         if not image_urls:
             logger.warning("未找到图片文件")
             return "[图片识别失败：未找到图片]"
+        
+        # 检查是否为GIF文件
+        image_url = image_urls[0]
+        is_gif, cache_file = await self._download_and_check_image(image_url)
+        if is_gif:
+            logger.debug("检测到GIF文件，跳过识别")
+            return "[GIF动画] 这是一个动态图片，包含动画效果"
         
         logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
         
