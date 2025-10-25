@@ -534,6 +534,10 @@ class HeartflowPlugin(star.Star):
         media_type = self._get_media_type(event)
         is_media = media_type != "unknown"
         
+        # 获取用户信息（媒体和文本消息都需要）
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+        
         # 处理媒体消息
         if is_media:
             if self.enable_media_recognition:
@@ -559,8 +563,6 @@ class HeartflowPlugin(star.Star):
         # 处理文本消息（非媒体消息）
         if not is_media:
             # 通过基础检查后，记录用户消息到缓冲区（包括@消息）
-            user_id = event.get_sender_id()
-            user_name = event.get_sender_name()
             message_content = f"[User ID: {user_id}, Nickname: {user_name}]\n{event.message_str}"
             self._record_message(event.unified_msg_origin, "user", message_content)
             logger.debug(f"✏️ 用户消息已记录 | {event.message_str[:30]}...")
@@ -600,6 +602,7 @@ class HeartflowPlugin(star.Star):
                         self._record_interaction(event.unified_msg_origin, user_id)
                     
                     return
+                    
                 else:
                     logger.debug(f"心流不回复 | 评分:{judge_result.overall_score:.2f}")
                     await self._update_passive_state(event, judge_result)
@@ -655,7 +658,7 @@ class HeartflowPlugin(star.Star):
             # === 替换对话历史 ===
             if hasattr(req, 'contexts'):
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
-                 
+                
                 if plugin_contexts:
                     # 移除最后一条用户消息（避免与 prompt 重复）
                     if plugin_contexts[-1].get("role") == "user":
@@ -1124,36 +1127,34 @@ class HeartflowPlugin(star.Star):
         else:
             prompt = "Please describe the image content."
         
+        # 提取图片URL
+        image_urls = self._extract_media_urls(event, "image")
+        if not image_urls:
+            logger.warning("未找到图片文件")
+            return "[图片识别失败：未找到图片]"
+        
+        logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
+        
+        # 设置媒体识别状态，防止钩子拦截
+        self.media_recognition_sessions.add(chat_id)
+        
         try:
-            # 提取图片URL
-            image_urls = self._extract_media_urls(event, "image")
-            if not image_urls:
-                logger.warning("未找到图片文件")
-                return "[图片识别失败：未找到图片]"
+            # 使用provider.text_chat进行图片识别
+            llm_resp = await provider.text_chat(
+                prompt=prompt,  # 用户提示词（必需）
+                image_urls=image_urls,  # 传入图片URL列表
+            )
             
-            logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
-            
-            # 设置媒体识别状态，防止钩子拦截
-            self.media_recognition_sessions.add(chat_id)
-            
-            try:
-                # 使用provider.text_chat进行图片识别
-                llm_resp = await provider.text_chat(
-                    prompt=prompt,  # 用户提示词（必需）
-                    image_urls=image_urls,  # 传入图片URL列表
-                )
-                
-                result = llm_resp.completion_text if llm_resp.completion_text else "[图片识别失败]"
-                logger.debug(f"图片识别结果: {result[:100]}...")
-                return result
-                
-            finally:
-                # 清理媒体识别状态
-                self.media_recognition_sessions.discard(chat_id)
+            result = llm_resp.completion_text if llm_resp.completion_text else "[图片识别失败]"
+            logger.debug(f"图片识别结果: {result[:100]}...")
+            return result
             
         except Exception as e:
             logger.error(f"图片识别失败: {e}")
             return f"[图片识别失败: {str(e)}]"
+        finally:
+            # 清理媒体识别状态
+            self.media_recognition_sessions.discard(chat_id)
 
     async def _recognize_audio_content(self, event: AstrMessageEvent) -> str:
         """使用STT模型将语音内容转录为文字"""
