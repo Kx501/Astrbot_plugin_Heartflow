@@ -17,6 +17,12 @@
     "default": false,
     "hint": "启用后，会自动识别图片、语音等媒体内容，并将识别结果加入对话历史"
   },
+  "skip_gif_processing": {
+    "description": "跳过GIF识别",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，GIF文件将跳过识别和心流判断"
+  },
   "judge_provider_name": {
     "description": "判断模型提供商名称",
     "type": "string",
@@ -198,10 +204,10 @@
     "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
   },
   "memory_summary_threshold": {
-    "description": "记忆总结触发阈值",
+    "description": "记忆总结阈值",
     "type": "float",
     "default": 0.8,
-    "hint": "当缓冲区使用率达到此比例时触发总结（0.8=80%）"
+    "hint": "当缓冲区达到此比例时触发总结。"
   },
   "enable_blacklist": {
     "description": "启用智能拉黑",

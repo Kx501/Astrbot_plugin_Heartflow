@@ -73,6 +73,17 @@ class HeartflowPlugin(star.Star):
         self.image_recognition_provider_name = self.config.get("image_recognition_provider", "")
         self.audio_recognition_provider_name = self.config.get("audio_recognition_provider", "")
         self.image_recognition_prompt = self.config.get("image_recognition_prompt", "")
+        
+        # 记录媒体识别配置状态
+        if self.image_recognition_provider_name:
+            logger.info(f"图片识别服务: {self.image_recognition_provider_name}")
+        elif self.enable_media_recognition:
+            logger.info("未配置图片识别服务，图片识别功能已禁用")
+        
+        if self.audio_recognition_provider_name:
+            logger.info(f"语音识别服务: {self.audio_recognition_provider_name}")
+        elif self.enable_media_recognition:
+            logger.info("未配置语音识别服务，语音识别功能已禁用")
 
         # 心流参数配置
         self.reply_threshold = self.config.get("reply_threshold", 0.6)
@@ -134,10 +145,6 @@ class HeartflowPlugin(star.Star):
         self.message_buffer: Dict[str, list] = {}
         self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
         
-        # ===== 智能记忆系统 =====
-        # 结构：{chat_id: {"summaries": [str], "last_summary_time": float}}
-        self.memory_system: Dict[str, Dict] = {}
-        
         # ===== AI拉黑系统 =====
         # 结构：{user_id: bool} - 简单的拉黑状态
         self.blacklist_system: Dict[str, bool] = {}
@@ -165,6 +172,9 @@ class HeartflowPlugin(star.Star):
         
         # AI拉黑系统配置
         self.enable_blacklist = self.config.get("enable_blacklist", False)
+        
+        # GIF处理配置
+        self.skip_gif_processing = self.config.get("skip_gif_processing", True)
         
         # 全局好感度存储：{user_id: favorability}
         # 跨群聊的用户好感度，不受白名单限制
@@ -1260,16 +1270,15 @@ class HeartflowPlugin(star.Star):
         """使用LLM模型识别图片内容，通过用户提示词设定识别要求"""
         chat_id = event.unified_msg_origin
         
-        # 获取图片识别提供商
-        provider_name = self.image_recognition_provider_name or self.judge_provider_name
-        if not provider_name:
-            logger.warning("图片识别模型提供商未配置")
+        # 只使用专用的图片识别提供商，不使用判断模型作为备用
+        if not self.image_recognition_provider_name:
+            logger.debug("未配置图片识别服务，跳过图片识别")
             return ""
         
         try:
-            provider = self.context.get_provider_by_id(provider_name)
+            provider = self.context.get_provider_by_id(self.image_recognition_provider_name)
             if not provider:
-                logger.warning(f"未找到图片识别提供商: {provider_name}")
+                logger.warning(f"未找到图片识别提供商: {self.image_recognition_provider_name}")
                 return ""
         except Exception as e:
             logger.error(f"获取图片识别提供商失败: {e}")
@@ -1279,7 +1288,7 @@ class HeartflowPlugin(star.Star):
         if self.image_recognition_prompt.strip():
             prompt = self.image_recognition_prompt.strip()
         else:
-            prompt = "请使用中文描述图片内容"
+            prompt = "请使用一段或几段话描述图片内容，不要使用md语法，不要有空行"
         
         # 提取图片URL
         image_urls = self._extract_media_urls(event, "image")
@@ -1288,11 +1297,12 @@ class HeartflowPlugin(star.Star):
             return "[图片识别失败：未找到图片]"
         
         # 检查是否为GIF文件
-        image_url = image_urls[0]
-        is_gif, cache_file = await self._download_and_check_image(image_url)
-        if is_gif:
-            logger.debug("检测到GIF文件，跳过识别和心流判断")
-            return ""  # 返回空字符串，表示跳过处理
+        if self.skip_gif_processing:
+            image_url = image_urls[0]
+            is_gif, cache_file = await self._download_and_check_image(image_url)
+            if is_gif:
+                logger.debug("检测到GIF文件，跳过识别和心流判断")
+                return ""  # 返回空字符串，表示跳过处理
         
         logger.debug(f"尝试识别图片内容，使用提示词: {prompt[:50]}...")
         
@@ -1319,10 +1329,9 @@ class HeartflowPlugin(star.Star):
 
     async def _recognize_audio_content(self, event: AstrMessageEvent) -> str:
         """使用STT模型将语音内容转录为文字"""
-        # 获取语音识别提供商
-        provider_name = self.audio_recognition_provider_name or self.judge_provider_name
-        if not provider_name:
-            logger.warning("语音识别模型提供商未配置")
+        # 只使用专用的语音识别提供商，不使用判断模型作为备用
+        if not self.audio_recognition_provider_name:
+            logger.debug("未配置语音识别服务，跳过语音识别")
             return ""
         
         try:
@@ -1330,12 +1339,12 @@ class HeartflowPlugin(star.Star):
             stt_providers = self.context.get_all_stt_providers()
             provider = None
             for p in stt_providers:
-                if p.provider_id == provider_name:
+                if p.provider_id == self.audio_recognition_provider_name:
                     provider = p
                     break
             
             if not provider:
-                logger.warning(f"未找到STTProvider: {provider_name}")
+                logger.warning(f"未找到STTProvider: {self.audio_recognition_provider_name}")
                 return ""
         except Exception as e:
             logger.error(f"获取语音识别提供商失败: {e}")
@@ -1423,6 +1432,7 @@ class HeartflowPlugin(star.Star):
         buffer_size = len(self.message_buffer[chat_id])
         threshold = int(self.max_buffer_size * self.memory_summary_threshold)
         
+        # 当缓冲区达到阈值时触发总结
         if buffer_size >= threshold:
             # 异步触发总结，不阻塞主流程
             import asyncio
@@ -1443,8 +1453,15 @@ class HeartflowPlugin(star.Star):
             if chat_id not in self.message_buffer or not self.message_buffer[chat_id]:
                 return
                 
-            # 获取需要总结的消息（前70%的消息）
-            messages_to_summarize = self.message_buffer[chat_id][:int(len(self.message_buffer[chat_id]) * 0.7)]
+            # 统一阈值逻辑：总结阈值范围内的消息，保留之外的消息
+            total_messages = len(self.message_buffer[chat_id])
+            summarize_count = int(total_messages * self.memory_summary_threshold)  # 例如：0.8表示总结前80%
+            
+            # 需要总结的消息（阈值范围内的）
+            messages_to_summarize = self.message_buffer[chat_id][:summarize_count]
+            
+            # 需要保留的消息（阈值范围外的）
+            keep_count = total_messages - summarize_count
             
             if len(messages_to_summarize) < 5:  # 消息太少，不总结
                 return
@@ -1456,35 +1473,31 @@ class HeartflowPlugin(star.Star):
             summary = await self._call_ai_for_summary(summary_prompt)
             
             if summary:
-                # 保存总结到记忆系统
-                if chat_id not in self.memory_system:
-                    self.memory_system[chat_id] = {"summaries": [], "last_summary_time": 0}
+                # 立即更新缓冲区：
+                # 1. 删除阈值范围内的旧消息
+                # 2. 插入总结作为历史记忆
+                # 3. 保留阈值范围外的详细消息
+                summary_msg = {
+                    "role": "system",
+                    "content": f"[历史总结] {summary}",
+                    "timestamp": time.time()
+                }
                 
-                self.memory_system[chat_id]["summaries"].append(summary)
-                self.memory_system[chat_id]["last_summary_time"] = time.time()
+                # 构建新的消息列表：总结 + 阈值范围外的详细消息
+                self.message_buffer[chat_id] = [summary_msg] + self.message_buffer[chat_id][-keep_count:]
                 
-                # 保留最近10个总结，避免内存过多
-                if len(self.memory_system[chat_id]["summaries"]) > 10:
-                    self.memory_system[chat_id]["summaries"] = self.memory_system[chat_id]["summaries"][-10:]
-                
-                # 从缓冲区中移除已总结的消息，保留最近30%
-                keep_count = int(len(self.message_buffer[chat_id]) * 0.3)
-                self.message_buffer[chat_id] = self.message_buffer[chat_id][-keep_count:]
-                
-                logger.info(f"群聊 {chat_id} 完成智能总结，保留 {keep_count} 条最新消息")
+                logger.info(f"群聊 {chat_id} 完成智能总结：总结前{summarize_count}条消息，保留后{keep_count}条详细消息")
                 
         except Exception as e:
             logger.error(f"创建记忆总结失败: {e}")
     
     def _build_summary_prompt(self, messages: list) -> str:
         """构建总结提示词"""
-        prompt = """请总结以下群聊对话的关键信息。要求：
-
-1. **客观记录**：如实记录对话内容，包括话题转换和用户行为
-2. **重点提取**：识别主要话题、重要事件、用户关系变化
-3. **行为分析**：注意用户的行为模式，包括正常交流和不当言论
-4. **简洁明了**：用简洁的语言概括，保留关键信息
-
+        prompt = """请用一段话总结以下群聊对话的关键信息。要求：
+- 客观记录：如实记录对话内容，包括话题转换和用户行为
+- 重点提取：识别主要话题、重要事件、用户关系变化
+- 行为分析：注意用户的行为模式，包括正常交流和不当言论
+- 简洁明了：用简洁的语言概括，保留关键信息
 对话内容：
 """
         
@@ -1513,13 +1526,17 @@ class HeartflowPlugin(star.Star):
                 logger.error(f"找不到判断模型提供商: {self.judge_provider_name}")
                 return ""
             
-            # 构建消息
-            messages = [{"role": "user", "content": prompt}]
+            # 调用AI - text_chat 需要直接传入 prompt 字符串
+            result = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],  # 不需要上下文
+                max_tokens=500
+            )
             
-            # 调用AI
-            result = await provider.text_chat(messages, max_tokens=500)
-            
-            if result and result.content:
+            # text_chat 返回 LLMResponse，需要获取 completion_text
+            if result and hasattr(result, 'completion_text') and result.completion_text:
+                return result.completion_text.strip()
+            elif result and hasattr(result, 'content') and result.content:
                 return result.content.strip()
             else:
                 logger.error("AI总结返回空结果")
@@ -1669,9 +1686,9 @@ class HeartflowPlugin(star.Star):
 - 回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
 
 配置参数:
-        - 回复阈值: {self.reply_threshold}
-        - 判断提供商: {self.judge_provider_name}
-        - 白名单模式: {'开启' if self.whitelist_enabled else '关闭'}
+- 回复阈值: {self.reply_threshold}
+- 判断提供商: {self.judge_provider_name}
+- 白名单模式: {'开启' if self.whitelist_enabled else '关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
 智能缓存:
@@ -1684,7 +1701,6 @@ class HeartflowPlugin(star.Star):
 - 社交适宜性: {self.weights['social']:.0%}
 - 时机恰当性: {self.weights['timing']:.0%}
 - 对话连贯性: {self.weights['continuity']:.0%}
-
 {fav_stats}
 """
 
