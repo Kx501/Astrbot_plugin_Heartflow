@@ -20,7 +20,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 @dataclass
 class JudgeResult:
     """判断结果数据类"""
-    relevance: float = 0.0
+    quality: float = 0.0
     willingness: float = 0.0
     social: float = 0.0
     timing: float = 0.0
@@ -162,11 +162,10 @@ class HeartflowPlugin(star.Star):
         # 好感度系统配置
         self.enable_favorability = self.config.get("enable_favorability", False)
         self.enable_global_favorability = self.config.get("enable_global_favorability", False)
-        self.favorability_impact_strength = self.config.get("favorability_impact_strength", 1.0)
         self.favorability_decay_daily = self.config.get("favorability_decay_daily", 1.0)
         self.initial_favorability = self.config.get("initial_favorability", 10.0)
         
-        # 智能记忆系统配置
+        # 智能总结配置
         self.enable_memory_system = self.config.get("enable_memory_system", True)
         self.memory_summary_threshold = self.config.get("memory_summary_threshold", 0.8)
         
@@ -183,16 +182,16 @@ class HeartflowPlugin(star.Star):
         
         # 好感度计算权重
         self.fav_weights = {
-            "relevance": self.config.get("fav_weight_relevance", 0.4),
-            "social": self.config.get("fav_weight_social", 0.3),
-            "continuity": self.config.get("fav_weight_continuity", 0.2),
-            "willingness": self.config.get("fav_weight_willingness", 0.05),
-            "timing": self.config.get("fav_weight_timing", 0.05)
+            "quality": self.config.get("fav_quality", 0.4),
+            "willingness": self.config.get("fav_willingness", 0.2),
+            "social": self.config.get("fav_social", 0.3),
+            "timing": self.config.get("fav_timing", 0.05),
+            "continuity": self.config.get("fav_continuity", 0.2),
         }
         
         # 判断权重配置
         self.weights = {
-            "relevance": self.config.get("judge_relevance", 0.25),
+            "quality": self.config.get("judge_quality", 0.25),
             "willingness": self.config.get("judge_willingness", 0.2),
             "social": self.config.get("judge_social", 0.2),
             "timing": self.config.get("judge_timing", 0.15),
@@ -367,21 +366,36 @@ class HeartflowPlugin(star.Star):
         if self.judge_include_reasoning:
             reasoning_part = ',\n    "reasoning": "详细分析原因，说明为什么应该或不应该回复，需要结合机器人角色特点进行分析，特别说明与上次回复的关联性"'
 
+        # 获取用户ID（提前获取，供后续使用）
+        user_id = event.get_sender_id()
+
+        # 拉黑相关部分：按需添加
+        blacklist_instruction = ""
+        blacklist_part = ""
+        blacklist_info = ""
+        if self.enable_blacklist:
+            blacklist_instruction = """拉黑判断:
+- 如果用户行为极度恶劣（如恶意刷屏、攻击性言论、垃圾信息等），设置 blacklist 为 "True"
+- 如果被拉黑的用户表现改善，设置 blacklist 为 "False"
+- 正常情况下，设置 blacklist 为空字符串 """""
+            blacklist_part = ',\n    "blacklist": "True/False" 或 ""'
+            if self._is_user_blacklisted(user_id):
+                blacklist_info = "\n当前用户已被拉黑，请观察后解封"
+
         # 使用配置的评估规则，如果没有配置则使用默认规则
         if self.judge_evaluation_rules:
             evaluation_rules = self.judge_evaluation_rules
         else:
-            evaluation_rules = """请从以下5个维度评估（0-10分），重要提醒：基于上述机器人角色设定来判断是否适合回复：
+            evaluation_rules = """基于上述机器人角色设定，从以下5个维度评估（0-10分），判断是否适合回复：
 
-1. 内容相关度(0-10)：消息是否有趣、有价值、适合我回复
+1. 内容价值性(0-10)：消息是否有趣、有价值、适合我回复
    - 考虑消息的质量、话题性、是否需要回应
    - 识别并过滤垃圾消息、无意义内容
-   - 结合机器人角色特点，判断是否符合角色定位
 
 2. 回复意愿(0-10)：基于当前状态，我回复此消息的意愿
-   - 考虑当前精力水平和对用户的印象
+   - 考虑当前精力水平
    - 考虑今日回复频率控制
-   - 基于机器人角色设定，判断是否应该主动参与此话题
+   - 结合机器人角色特点，判断是否应该主动参与此话题
 
 3. 社交适宜性(0-10)：在当前群聊氛围下回复是否合适
    - 考虑群聊活跃度和讨论氛围
@@ -394,11 +408,9 @@ class HeartflowPlugin(star.Star):
 5. 对话连贯性(0-10)：当前消息与上次机器人回复的关联程度
    - 查看对话历史中最后的[我的回复]
    - 如果当前消息是对我上次回复的回应或延续，给高分
-   - 如果当前消息与我上次回复无关，给中等分数
-   - 如果对话历史中没有我的回复记录，给低分"""
+   - 如果当前消息与我上次回复无关，给低分"""
 
-        # 获取好感度信息
-        user_id = event.get_sender_id()
+        # 获取好感度信息（user_id已在前面获取）
         user_fav = self._get_user_favorability(event.unified_msg_origin, user_id)
         
         # 好感度描述
@@ -406,6 +418,27 @@ class HeartflowPlugin(star.Star):
         if self.enable_favorability:
             level, emoji = self._get_favorability_level(user_fav)
             fav_info = f"\n对当前用户的好感度: {user_fav:.0f}/100 ({level} {emoji})"
+        
+        # 获取待判断消息的完整内容（从缓冲区获取，如果是媒体消息会包含识别结果）
+        message_content = event.message_str
+        chat_id = event.unified_msg_origin
+        
+        # 尝试从缓冲区获取最后一条消息的完整内容
+        if chat_id in self.message_buffer and self.message_buffer[chat_id]:
+            last_msg = self.message_buffer[chat_id][-1]
+            if last_msg.get("role") == "user":
+                # 移除用户信息前缀，只保留实际内容部分
+                raw_content = last_msg.get("content", "")
+                # 检查是否包含User ID和Nickname前缀
+                if "\n" in raw_content:
+                    # 提取实际内容部分
+                    content_lines = raw_content.split("\n", 1)
+                    if len(content_lines) > 1:
+                        message_content = content_lines[1]
+                    else:
+                        message_content = raw_content
+                else:
+                    message_content = raw_content
         
         # 构建完整的判断提示词
         judge_prompt = f"""
@@ -415,12 +448,11 @@ class HeartflowPlugin(star.Star):
 - 对话历史已提供给你，你可以查看完整的对话流程
 - [群友消息] = 群友发送的消息
 - [我的回复] = 机器人（我）发送的回复
+- [图片] = 图片消息的识别内容
+- [语音] = 语音消息的识别内容
 
 机器人角色设定:
 {persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
-
-当前群聊ID:
-{event.unified_msg_origin}
 
 机器人状态:
 我的精力水平: {chat_state.energy:.1f}/1.0
@@ -430,28 +462,21 @@ class HeartflowPlugin(star.Star):
 
 待判断消息:
 发送者: {event.get_sender_name()}
-内容: {event.message_str}
-时间: {datetime.datetime.now().strftime('%H:%M:%S')}
+内容: {message_content}
+时间: {datetime.datetime.now().strftime('%H:%M:%S')}{blacklist_info}
 
 {evaluation_rules}
 
-回复阈值: {self.reply_threshold} (综合评分达到此分数才回复)
-
-拉黑判断:
-- 如果用户行为极度恶劣（如恶意刷屏、攻击性言论、垃圾信息等），设置 blacklist 为 "True"
-- 如果被拉黑的用户表现改善，设置 blacklist 为 "False"
-- 正常情况下，设置 blacklist 为空字符串 ""
+{blacklist_instruction}
 
 重要！！！请严格按照以下JSON格式回复，不要添加任何其他内容：
 
-请以JSON格式回复：
 {{
-    "relevance": 分数,
+    "quality": 分数,
     "willingness": 分数,
     "social": 分数,
     "timing": 分数,
-    "continuity": 分数{reasoning_part},
-    "blacklist": "True/False" 或 ""
+    "continuity": 分数{reasoning_part}{blacklist_part}
 }}
 
 注意：你的回复必须是完整的JSON对象，不要包含任何解释性文字或其他内容！
@@ -489,7 +514,7 @@ class HeartflowPlugin(star.Star):
                 judge_data = json.loads(content)
 
                 # 直接从JSON根对象获取分数
-                relevance = judge_data.get("relevance", 0)
+                quality = judge_data.get("quality", 0)
                 willingness = judge_data.get("willingness", 0)
                 social = judge_data.get("social", 0)
                 timing = judge_data.get("timing", 0)
@@ -497,33 +522,20 @@ class HeartflowPlugin(star.Star):
                 
                 # 计算综合评分
                 overall_score = (
-                    relevance * self.weights["relevance"] +
+                    quality * self.weights["quality"] +
                     willingness * self.weights["willingness"] +
                     social * self.weights["social"] +
                     timing * self.weights["timing"] +
                     continuity * self.weights["continuity"]
                 ) / 10.0
 
-                # 首先判断是否达到基础阈值
-                meets_threshold = overall_score >= self.reply_threshold
+                # 判断是否达到基础阈值
+                should_reply = overall_score >= self.reply_threshold
                 
-                # 如果达到阈值，再根据好感度概率性决定是否回复
-                should_reply = False
-                reply_probability = 1.0
-                random_roll = 0.0
-                
-                if meets_threshold:
-                    reply_probability = self._calculate_reply_probability(user_fav)
-                    random_roll = random.random()
-                    should_reply = random_roll <= reply_probability
-                
-                if self.enable_favorability:
-                    logger.debug(f"好感度概率判定: 好感度={user_fav:.0f} | 概率={reply_probability:.2%} | 随机数={random_roll:.3f} | 结果={'通过' if should_reply else '未通过'}")
-                else:
-                    logger.debug(f"未达到基础阈值 {self.reply_threshold:.2f}，不回复")
+                logger.debug(f"心流评分判定: 综合评分={overall_score:.2f} | 阈值={self.reply_threshold:.2f} | 结果={'通过' if should_reply else '未通过'}")
 
                 return JudgeResult(
-                    relevance=relevance,
+                    quality=quality,
                     willingness=willingness,
                     social=social,
                     timing=timing,
@@ -559,12 +571,6 @@ class HeartflowPlugin(star.Star):
                 return
         
         if event.get_sender_id() == event.get_self_id():
-            return
-        
-        # 检查用户是否被拉黑
-        user_id = event.get_sender_id()
-        if self._is_user_blacklisted(user_id):
-            logger.debug(f"用户 {user_id} 已被拉黑，跳过处理")
             return
         
         # 获取媒体类型，如果不是unknown则认为是媒体消息
@@ -723,13 +729,45 @@ class HeartflowPlugin(star.Star):
             # 检测AstrBot原生识图：检查系统提示词是否包含图片识别结果
             system_prompt = getattr(req, 'system_prompt', '') or ''
             
-            # 主要检测特征：Image Caption:（AstrBot原生识图的主要标识）
-            if 'Image Caption:' in system_prompt:
-                logger.debug("⚠️ 检测到AstrBot原生识图，跳过消息历史替换")
-                return
-            
             # === 替换对话历史 ===
             if hasattr(req, 'contexts'):
+                if 'Image Caption:' in system_prompt:
+                    # 原生识图模式：只保留最后一条用户提问的消息
+                    # 因为AstrBot会将识图结果插入系统提示词，消息列表太长会混淆
+                    chat_id = event.unified_msg_origin
+                    plugin_contexts = []
+                    
+                    # 直接从消息缓冲区获取最后一条用户消息
+                    if chat_id in self.message_buffer and self.message_buffer[chat_id]:
+                        buffer_messages = self.message_buffer[chat_id]
+                        # 从后往前查找最后一条用户消息
+                        for msg in reversed(buffer_messages):
+                            if msg.get("role") == "user":
+                                content = msg.get("content", "")
+                                if content:
+                                    plugin_contexts = [{
+                                        "role": "user",
+                                        "content": content
+                                    }]
+                                    logger.debug("⚠️ 检测到AstrBot原生识图，只保留最后一条用户消息")
+                                break
+                        
+                        if not plugin_contexts:
+                            logger.debug("⚠️ 检测到AstrBot原生识图，但未找到用户消息，清空历史")
+                            # 未找到用户消息，清空contexts并返回
+                            req.contexts = []
+                            return
+                    else:
+                        logger.debug("⚠️ 检测到AstrBot原生识图，消息缓冲区为空")
+                        # 缓冲区为空，清空contexts并返回
+                        req.contexts = []
+                        return
+                    
+                    # 替换对话历史（只包含最后一条用户消息）
+                    req.contexts = plugin_contexts
+                    return
+                
+                # 普通模式：使用完整的消息历史
                 plugin_contexts = await self._get_recent_contexts(event, add_labels=False)
                 
                 if plugin_contexts:
@@ -1015,7 +1053,7 @@ class HeartflowPlugin(star.Star):
             return 0.0
         
         # === 归一化5个维度（0-10 → 0-1） ===
-        norm_relevance = judge_result.relevance / 10.0
+        norm_quality = judge_result.quality / 10.0
         norm_social = judge_result.social / 10.0
         norm_continuity = judge_result.continuity / 10.0
         norm_willingness = judge_result.willingness / 10.0
@@ -1023,7 +1061,7 @@ class HeartflowPlugin(star.Star):
         
         # === 计算综合质量分（0-1） ===
         quality_score = (
-            norm_relevance * self.fav_weights["relevance"] +
+            norm_quality * self.fav_weights["quality"] +
             norm_social * self.fav_weights["social"] +
             norm_continuity * self.fav_weights["continuity"] +
             norm_willingness * self.fav_weights["willingness"] +
@@ -1140,31 +1178,6 @@ class HeartflowPlugin(star.Star):
                     recovery = min(50 - current, decay_rate * 2.0)
                     self.global_favorability[user_id] = current + recovery
     
-    def _calculate_reply_probability(self, favorability: float) -> float:
-        """根据好感度计算回复概率（0.0-1.0）
-        
-        好感度与回复概率直接对应：
-        - 冷淡（0-19）  → 0-19% 概率
-        - 陌生（20-34） → 20-34% 概率
-        - 普通（35-64） → 35-64% 概率
-        - 熟人（65-74） → 65-74% 概率
-        - 好友（75-84） → 75-84% 概率
-        - 挚友（85-100）→ 85-100% 概率
-        """
-        if not self.enable_favorability:
-            return 1.0  # 未启用好感度系统时，始终回复
-        
-        # 好感度值直接转换为概率（0-100 → 0.0-1.0）
-        base_probability = favorability / 100.0
-        
-        # 应用影响强度调整
-        # favorability_impact_strength = 1.0 时使用完整的好感度影响
-        # < 1.0 时减弱好感度的影响，使概率更接近1.0
-        # > 1.0 时增强好感度的影响（不推荐，会让低好感度更难回复）
-        adjusted_probability = 1.0 - (1.0 - base_probability) * self.favorability_impact_strength
-        
-        # 确保概率在有效范围内
-        return max(0.0, min(1.0, adjusted_probability))
 
     async def _recognize_media_content(self, event: AstrMessageEvent) -> str:
         """媒体内容识别主入口：根据媒体类型调用对应的识别方法"""
@@ -1478,7 +1491,7 @@ class HeartflowPlugin(star.Star):
                 # 2. 插入总结作为历史记忆
                 # 3. 保留阈值范围外的详细消息
                 summary_msg = {
-                    "role": "system",
+                    "role": "assistant",
                     "content": f"[历史总结] {summary}",
                     "timestamp": time.time()
                 }
@@ -1591,6 +1604,7 @@ class HeartflowPlugin(star.Star):
         for msg in recent_messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
+            # timestamp = msg.get("timestamp", 0)
             
             if role in ["user", "assistant"] and content:
                 if add_labels:
@@ -1606,10 +1620,15 @@ class HeartflowPlugin(star.Star):
                             "content": f"[我的回复] {content}"
                         }
                 else:
-                    # 为大模型保持原始格式
+                    # 为大模型添加时间戳（包含年月日和星期几）
+                    # time_tuple = time.localtime(timestamp)
+                    # weekday_map = {0: '周一', 1: '周二', 2: '周三', 3: '周四', 4: '周五', 5: '周六', 6: '周日'}
+                    # weekday = weekday_map[time_tuple.tm_wday]
+                    # date_str = time.strftime("%Y-%m-%d", time_tuple)
+                    # time_str = time.strftime("%H:%M:%S", time_tuple)
                     clean_msg = {
                         "role": role,
-                        "content": content
+                        "content": f"{content}"
                     }
                 filtered_context.append(clean_msg)
         
@@ -1664,16 +1683,13 @@ class HeartflowPlugin(star.Star):
                 avg_fav = sum(fav_data.values()) / total_users
                 high_fav = len([f for f in fav_data.values() if f >= 70])
                 low_fav = len([f for f in fav_data.values() if f <= 30])
-                fav_stats = f"""
-好感度统计（{fav_scope}）:
+                fav_stats = f"""好感度统计（{fav_scope}）:
 - 记录用户数: {total_users}
 - 平均好感度: {avg_fav:.1f}/100
 - 高好感用户: {high_fav}个 (≥70)
-- 低好感用户: {low_fav}个 (≤30)
-"""
+- 低好感用户: {low_fav}个 (≤30)"""
 
-        status_info = f"""
-心流状态报告
+        status_info = f"""心流状态报告
 
 当前状态:
 - 群聊ID: {event.unified_msg_origin}
@@ -1696,13 +1712,13 @@ class HeartflowPlugin(star.Star):
 - 消息缓冲区: {len(self.message_buffer[chat_id]) if chat_id in self.message_buffer else 0}/{self.max_buffer_size} 条
 
 评分权重:
-- 内容相关度: {self.weights['relevance']:.0%}
+- 内容价值性: {self.weights['quality']:.0%}
 - 回复意愿: {self.weights['willingness']:.0%}
 - 社交适宜性: {self.weights['social']:.0%}
 - 时机恰当性: {self.weights['timing']:.0%}
 - 对话连贯性: {self.weights['continuity']:.0%}
-{fav_stats}
-"""
+
+{fav_stats}"""
 
         event.set_result(event.plain_result(status_info))
 
@@ -1809,7 +1825,6 @@ class HeartflowPlugin(star.Star):
         user_fav = self._get_user_favorability(chat_id, user_id)
         interaction_count = self._get_user_interaction_count(chat_id, user_id)
         level, emoji = self._get_favorability_level(user_fav)
-        reply_prob = self._calculate_reply_probability(user_fav)
         
         # 判断使用的是全局还是群聊好感度
         fav_source = "全局（跨群聊）" if (self.enable_global_favorability and user_id in self.global_favorability) else "当前群聊"
@@ -1825,13 +1840,7 @@ class HeartflowPlugin(star.Star):
 互动次数：{interaction_count}次
 数据范围：{fav_source}
 
-影响效果：
-- 基础阈值：{self.reply_threshold:.2f}
-- 回复概率：{reply_prob:.1%}
-- 预期回复率：当消息评分达到阈值时，约{reply_prob:.1%}的消息会获得回复
-
 系统状态：
-- 好感度影响强度：{self.favorability_impact_strength}
 - 每日衰减速度：{self.favorability_decay_daily}
 """
         
@@ -1861,10 +1870,10 @@ class HeartflowPlugin(star.Star):
         )
         
         result = "好感度排行榜\n\n"
-        for i, (uid, fav) in enumerate(sorted_users[:10], 1):
+        for i, (uid, fav) in enumerate[tuple[str, float]][tuple[str, float]](sorted_users[:10], 1):
             level, emoji = self._get_favorability_level(fav)
             interaction = chat_state.user_interaction_count.get(uid, 0)
-            result += f"{i}. 用户{uid[-6:]}: {fav:.0f}/100 {emoji} ({level}, {interaction}次互动)\n"
+            result += f"{i}. 用户{uid}:\n{fav:.0f}/100 {emoji} ({level}, {interaction}次互动)\n"
         
         if len(sorted_users) > 10:
             result += f"\n...还有{len(sorted_users) - 10}个用户"

@@ -27,19 +27,22 @@
     "description": "判断模型提供商名称",
     "type": "string",
     "default": "",
-    "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商"
+    "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商",
+    "_special": "select_provider"
   },
   "image_recognition_provider": {
     "description": "图片识别模型提供商名称",
     "type": "string",
     "default": "",
-    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型。"
+    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型。",
+    "_special": "select_provider"
   },
   "audio_recognition_provider": {
     "description": "语音识别模型提供商名称",
     "type": "string",
     "default": "",
-    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型。"
+    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型。",
+    "_special": "select_provider_stt"
   },
   "image_recognition_prompt": {
     "description": "图片识别提示词",
@@ -83,35 +86,35 @@
     "default": [],
     "hint": "允许心流回复的群聊sid列表，/sid获取"
   },
-  "judge_relevance": {
-    "description": "判断权重的内容相关度",
+  "judge_quality": {
+    "description": "内容价值性的判断权重",
     "type": "float",
     "default": 0.25,
-    "hint": "针对判断权重的内容相关度设置，默认25%"
+    "hint": "针对内容价值性的判断权重设置，默认25%"
   },
   "judge_willingness": {
-    "description": "判断权重的回复意愿",
+    "description": "回复意愿的判断权重",
     "type": "float",
     "default": 0.2,
-    "hint": "针对判断权重的回复意愿设置，默认20%"
+    "hint": "针对回复意愿的判断权重设置，默认20%"
   },
   "judge_social": {
-    "description": "判断权重的社交适宜性",
+    "description": "社交适宜性的判断权重",
     "type": "float",
     "default": 0.2,
-    "hint": "针对判断权重的社交适宜性设置，默认20%"
+    "hint": "针对社交适宜性的判断权重设置，默认20%"
   },
   "judge_timing": {
-    "description": "判断权重的时机相关性",
+    "description": "时机恰当性的判断权重",
     "type": "float",
     "default": 0.15,
-    "hint": "针对判断权重的时机相关性设置，默认15%"
+    "hint": "针对时机恰当性的判断权重设置，默认15%"
   },
   "judge_continuity": {
-    "description": "判断权重的对话连贯性",
+    "description": "对话连贯性的判断权重",
     "type": "float",
     "default": 0.2,
-    "hint": "针对判断权重的对话连贯性设置，默认20%"
+    "hint": "针对对话连贯性的判断权重设置，默认20%"
   },
   "judge_include_reasoning": {
     "description": "判断时是否包含理由",
@@ -123,7 +126,9 @@
     "description": "判断评估规则",
     "type": "text",
     "default": "",
-    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则。"
+    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则。",
+    "editor_mode": true,
+    "editor_language": "markdown"
   },
   "summarize_instruction": {
     "description": "系统提示词总结指令",
@@ -141,7 +146,7 @@
     "description": "启用好感度系统",
     "type": "bool",
     "default": false,
-    "hint": "启用后，机器人会记住与每个用户的互动质量，调整对不同用户的回复积极性。好感度高的用户更容易获得回复。"
+    "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况。"
   },
   "enable_global_favorability": {
     "description": "启用全局好感度",
@@ -155,50 +160,44 @@
     "default": 10.0,
     "hint": "新用户第一次互动时的好感度初始值（0-100）。"
   },
-  "favorability_impact_strength": {
-    "description": "好感度影响强度",
-    "type": "float",
-    "default": 1.0,
-    "hint": "好感度对回复概率的影响程度。1.0=完全影响（好感度值直接等于回复概率），0.5=减弱影响，0=无影响，推荐1.0。"
-  },
   "favorability_decay_daily": {
     "description": "每日好感度衰减",
     "type": "float",
     "default": 1.0,
     "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0。"
   },
-  "fav_weight_relevance": {
-    "description": "好感度计算-内容相关度权重",
+  "fav_quality": {
+    "description": "内容价值性的好感度权重",
     "type": "float",
     "default": 0.4,
     "hint": "内容质量对好感度的影响权重，默认40%"
   },
-  "fav_weight_social": {
-    "description": "好感度计算-社交适宜性权重",
+  "fav_social": {
+    "description": "社交适宜性的好感度权重",
     "type": "float",
     "default": 0.3,
     "hint": "社交礼貌对好感度的影响权重，默认30%"
   },
-  "fav_weight_continuity": {
-    "description": "好感度计算-对话连贯性权重",
+  "fav_continuity": {
+    "description": "对话连贯性的好感度权重",
     "type": "float",
     "default": 0.2,
-    "hint": "对话延续性对好感度的影响权重，默认20%"
+    "hint": "对话连贯性对好感度的影响权重，默认20%"
   },
-  "fav_weight_willingness": {
-    "description": "好感度计算-回复意愿权重",
+  "fav_willingness": {
+    "description": "回复意愿的好感度权重",
     "type": "float",
     "default": 0.05,
     "hint": "回复意愿对好感度的影响权重，默认5%"
   },
-  "fav_weight_timing": {
-    "description": "好感度计算-时机恰当性权重",
+  "fav_timing": {
+    "description": "时机恰当性的好感度权重",
     "type": "float",
     "default": 0.05,
     "hint": "时机把握对好感度的影响权重，默认5%"
   },
   "enable_memory_system": {
-    "description": "启用智能记忆系统",
+    "description": "启用智能总结",
     "type": "bool",
     "default": true,
     "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
