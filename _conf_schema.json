@@ -1,224 +1,64 @@
 {
-  "enable_heartflow": {
-    "description": "启用心流主动回复",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，机器人将智能判断群聊消息并主动回复"
+  "heartflow": {
+    "description": "心流相关配置",
+    "type": "object",
+    "items": {
+      "enable_heartflow": { "type": "bool", "default": false, "description": "启用心流主动回复", "hint": "启用后，机器人将智能判断群聊消息并主动回复" },
+      "judge_provider_name": { "type": "string", "default": "", "description": "判断模型提供商名称", "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商", "_special": "select_provider" },
+      "reply_threshold": { "type": "float", "default": 0.6, "description": "回复阈值(0-1)", "hint": "超过此阈值才会主动回复，值越高越严格" },
+      "energy_decay_rate": { "type": "float", "default": 0.1, "description": "精力衰减速度", "hint": "每次回复后精力下降的幅度，影响后续回复的积极性" },
+      "energy_recovery_rate": { "type": "float", "default": 0.02, "description": "精力恢复速度", "hint": "每次不回复时精力恢复的幅度" },
+      "message_window": { "type": "int", "default": 50, "description": "消息窗口大小", "hint": "同时作为消息缓冲区大小与判断时使用的最近消息数量" },
+      "whitelist_enabled": { "type": "bool", "default": false, "description": "启用群聊白名单", "hint": "启用后只有白名单中的群聊才会触发心流回复" },
+      "chat_whitelist": { "type": "list", "default": [], "description": "群聊白名单", "hint": "允许心流回复的群聊sid列表，/sid获取" },
+      "judge_quality": { "type": "float", "default": 0.25, "description": "内容价值性的判断权重", "hint": "针对内容价值性的判断权重设置，默认25%" },
+      "judge_willingness": { "type": "float", "default": 0.2, "description": "回复意愿的判断权重", "hint": "针对回复意愿的判断权重设置，默认20%" },
+      "judge_social": { "type": "float", "default": 0.2, "description": "社交适宜性的判断权重", "hint": "针对社交适宜性的判断权重设置，默认20%" },
+      "judge_timing": { "type": "float", "default": 0.15, "description": "时机恰当性的判断权重", "hint": "针对时机恰当性的判断权重设置，默认15%" },
+      "judge_continuity": { "type": "float", "default": 0.2, "description": "对话连贯性的判断权重", "hint": "针对对话连贯性的判断权重设置，默认20%" },
+      "judge_include_reasoning": { "type": "bool", "default": true, "description": "判断时是否包含理由", "hint": "让小模型在判断时返回详细理由。关闭可轻微提升性能和鲁棒性。" },
+      "judge_evaluation_rules": { "type": "text", "default": "", "description": "判断评估规则", "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则", "editor_mode": true, "editor_language": "markdown" }
+    }
   },
-  "enable_media_judge": {
-    "description": "启用媒体消息心流判断",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，图片、语音等媒体消息也会触发心流判断（需要先开启媒体识别）"
+  
+  "media": {
+    "description": "媒体识别相关配置",
+    "type": "object",
+    "items": {
+      "enable_media_judge": { "type": "bool", "default": false, "description": "启用媒体消息心流判断", "hint": "启用后，图片、语音等媒体消息也会触发心流判断（需要先开启媒体识别）" },
+      "enable_media_recognition": { "type": "bool", "default": false, "description": "启用媒体内容识别", "hint": "启用后，会自动识别图片、语音等媒体内容，并将识别结果加入对话历史" },
+      "skip_gif_processing": { "type": "bool", "default": true, "description": "跳过GIF识别", "hint": "启用后，GIF文件将跳过识别和心流判断" },
+      "image_recognition_provider": { "type": "string", "default": "", "description": "图片识别模型提供商名称", "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型", "_special": "select_provider" },
+      "audio_recognition_provider": { "type": "string", "default": "", "description": "语音识别模型提供商名称", "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型", "_special": "select_provider_stt" },
+      "image_recognition_prompt": { "type": "text", "default": "", "description": "图片识别提示词", "hint": "图片识别的用户提示词。留空则使用默认提示词" }
+    }
   },
-  "enable_media_recognition": {
-    "description": "启用媒体内容识别",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，会自动识别图片、语音等媒体内容，并将识别结果加入对话历史"
+  
+  "summary": {
+    "description": "总结相关配置",
+    "type": "object",
+    "items": {
+      "enable_memory_system": { "type": "bool", "default": true, "description": "启用智能总结", "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆" },
+      "memory_summary_threshold": { "type": "float", "default": 0.8, "description": "记忆总结阈值", "hint": "当缓冲区达到此比例时触发总结" },
+      "summary_provider": { "type": "string", "default": "", "description": "总结模型提供商名称", "hint": "用于总结的模型提供商。留空则不启用", "_special": "select_provider" },
+      "summary_prompt": { "type": "text", "default": "", "description": "总结提示词", "hint": "用于历史消息总结的自定义提示词。留空则使用默认提示词" }
+    }
   },
-  "skip_gif_processing": {
-    "description": "跳过GIF识别",
-    "type": "bool",
-    "default": true,
-    "hint": "启用后，GIF文件将跳过识别和心流判断"
-  },
-  "enable_memory_system": {
-    "description": "启用智能总结",
-    "type": "bool",
-    "default": true,
-    "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
-  },
-  "enable_blacklist": {
-    "description": "启用智能拉黑",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，AI会根据消息内容动态判断是否需要拉黑或解封用户"
-  },
-  "judge_provider_name": {
-    "description": "判断模型提供商名称",
-    "type": "string",
-    "default": "",
-    "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商",
-    "_special": "select_provider"
-  },
-  "image_recognition_provider": {
-    "description": "图片识别模型提供商名称",
-    "type": "string",
-    "default": "",
-    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型",
-    "_special": "select_provider"
-  },
-  "audio_recognition_provider": {
-    "description": "语音识别模型提供商名称",
-    "type": "string",
-    "default": "",
-    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型",
-    "_special": "select_provider_stt"
-  },
-  "summary_provider": {
-    "description": "总结模型提供商名称",
-    "type": "string",
-    "default": "",
-    "hint": "用于总结的模型提供商。留空则不启用",
-    "_special": "select_provider"
-  },
-  "image_recognition_prompt": {
-    "description": "图片识别提示词",
-    "type": "text",
-    "default": "",
-    "hint": "图片识别的用户提示词。留空则使用默认提示词"
-  },
-  "summary_prompt": {
-    "description": "总结提示词",
-    "type": "text",
-    "default": "",
-    "hint": "用于历史消息总结的自定义提示词。留空则使用默认提示词"
-  },
-  "reply_threshold": {
-    "description": "回复阈值(0-1)",
-    "type": "float",
-    "default": 0.6,
-    "hint": "超过此阈值才会主动回复，值越高越严格"
-  },
-  "energy_decay_rate": {
-    "description": "精力衰减速度",
-    "type": "float",
-    "default": 0.1,
-    "hint": "每次回复后精力下降的幅度，影响后续回复的积极性"
-  },
-  "energy_recovery_rate": {
-    "description": "精力恢复速度",
-    "type": "float",
-    "default": 0.02,
-    "hint": "每次不回复时精力恢复的幅度"
-  },
-  "message_window": {
-    "description": "消息窗口大小",
-    "type": "int",
-    "default": 50,
-    "hint": "同时作为消息缓冲区大小与判断时使用的最近消息数量"
-  },
-  "whitelist_enabled": {
-    "description": "启用群聊白名单",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后只有白名单中的群聊才会触发心流回复"
-  },
-  "chat_whitelist": {
-    "description": "群聊白名单",
-    "type": "list",
-    "default": [],
-    "hint": "允许心流回复的群聊sid列表，/sid获取"
-  },
-  "judge_quality": {
-    "description": "内容价值性的判断权重",
-    "type": "float",
-    "default": 0.25,
-    "hint": "针对内容价值性的判断权重设置，默认25%"
-  },
-  "judge_willingness": {
-    "description": "回复意愿的判断权重",
-    "type": "float",
-    "default": 0.2,
-    "hint": "针对回复意愿的判断权重设置，默认20%"
-  },
-  "judge_social": {
-    "description": "社交适宜性的判断权重",
-    "type": "float",
-    "default": 0.2,
-    "hint": "针对社交适宜性的判断权重设置，默认20%"
-  },
-  "judge_timing": {
-    "description": "时机恰当性的判断权重",
-    "type": "float",
-    "default": 0.15,
-    "hint": "针对时机恰当性的判断权重设置，默认15%"
-  },
-  "judge_continuity": {
-    "description": "对话连贯性的判断权重",
-    "type": "float",
-    "default": 0.2,
-    "hint": "针对对话连贯性的判断权重设置，默认20%"
-  },
-  "judge_include_reasoning": {
-    "description": "判断时是否包含理由",
-    "type": "bool",
-    "default": true,
-    "hint": "让小模型在判断时返回详细理由。关闭可轻微提升性能和鲁棒性。"
-  },
-  "judge_evaluation_rules": {
-    "description": "判断评估规则",
-    "type": "text",
-    "default": "",
-    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则",
-    "editor_mode": true,
-    "editor_language": "markdown"
-  },
-  "summarize_instruction": {
-    "description": "系统提示词总结指令",
-    "type": "text",
-    "default": "",
-    "hint": "自定义精简提示词，说明如何总结机器人角色设定。留空使用默认指令"
-  },
-  "enable_favorability": {
-    "description": "启用好感度系统",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况"
-  },
-  "enable_global_favorability": {
-    "description": "启用全局好感度",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，用户的好感度在所有群聊中共享。注意：如果启用了白名单，全局好感度也只在白名单群聊中生效。前置条件：enable_favorability=true"
-  },
-  "initial_favorability": {
-    "description": "新用户初始好感度",
-    "type": "float",
-    "default": 10.0,
-    "hint": "新用户第一次互动时的好感度初始值（0-100）"
-  },
-  "favorability_decay_daily": {
-    "description": "每日好感度衰减",
-    "type": "float",
-    "default": 1.0,
-    "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0"
-  },
-  "fav_quality": {
-    "description": "内容价值性的好感度权重",
-    "type": "float",
-    "default": 0.4,
-    "hint": "内容质量对好感度的影响权重，默认40%"
-  },
-  "fav_social": {
-    "description": "社交适宜性的好感度权重",
-    "type": "float",
-    "default": 0.3,
-    "hint": "社交礼貌对好感度的影响权重，默认30%"
-  },
-  "fav_continuity": {
-    "description": "对话连贯性的好感度权重",
-    "type": "float",
-    "default": 0.2,
-    "hint": "对话连贯性对好感度的影响权重，默认20%"
-  },
-  "fav_willingness": {
-    "description": "回复意愿的好感度权重",
-    "type": "float",
-    "default": 0.05,
-    "hint": "回复意愿对好感度的影响权重，默认5%"
-  },
-  "fav_timing": {
-    "description": "时机恰当性的好感度权重",
-    "type": "float",
-    "default": 0.05,
-    "hint": "时机把握对好感度的影响权重，默认5%"
-  },
-  "memory_summary_threshold": {
-    "description": "记忆总结阈值",
-    "type": "float",
-    "default": 0.8,
-    "hint": "当缓冲区达到此比例时触发总结。"
+  
+  "favorability": {
+    "description": "好感度相关配置",
+    "type": "object",
+    "items": {
+      "enable_favorability": { "type": "bool", "default": false, "description": "启用好感度系统", "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况" },
+      "enable_global_favorability": { "type": "bool", "default": false, "description": "启用全局好感度", "hint": "启用后，用户的好感度在所有群聊中共享。注意：如果启用了白名单，全局好感度也只在白名单群聊中生效。前置条件：enable_favorability=true" },
+      "initial_favorability": { "type": "float", "default": 10.0, "description": "新用户初始好感度", "hint": "新用户第一次互动时的好感度初始值（0-100）" },
+      "favorability_decay_daily": { "type": "float", "default": 1.0, "description": "每日好感度衰减", "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0" },
+      "fav_quality": { "type": "float", "default": 0.4, "description": "内容价值性的好感度权重", "hint": "内容质量对好感度的影响权重，默认40%" },
+      "fav_social": { "type": "float", "default": 0.3, "description": "社交适宜性的好感度权重", "hint": "社交礼貌对好感度的影响权重，默认30%" },
+      "fav_continuity": { "type": "float", "default": 0.2, "description": "对话连贯性的好感度权重", "hint": "对话连贯性对好感度的影响权重，默认20%" },
+      "fav_willingness": { "type": "float", "default": 0.05, "description": "回复意愿的好感度权重", "hint": "回复意愿对好感度的影响权重，默认5%" },
+      "fav_timing": { "type": "float", "default": 0.05, "description": "时机恰当性的好感度权重", "hint": "时机把握对好感度的影响权重，默认5%" },
+      "enable_blacklist": { "type": "bool", "default": false, "description": "启用智能拉黑", "hint": "启用后，会根据消息内容动态判断是否需要拉黑或解封用户" }
+    }
   }
 }

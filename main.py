@@ -1,7 +1,6 @@
 import json
 import time
 import datetime
-import random
 import aiohttp
 
 from typing import Dict, Optional
@@ -24,17 +23,14 @@ class JudgeResult:
     willingness: float = 0.0
     social: float = 0.0
     timing: float = 0.0
-    continuity: float = 0.0  # 新增：与上次回复的连贯性
+    continuity: float = 0.0
     reasoning: str = ""
     should_reply: bool = False
-    confidence: float = 0.0
     overall_score: float = 0.0
-    related_messages: list = None
-    blacklist: str = ""  # 新增：拉黑动作 "True", "False", ""
+    blacklist: str = ""
 
     def __post_init__(self):
-        if self.related_messages is None:
-            self.related_messages = []
+        pass
 
 
 @dataclass
@@ -64,15 +60,25 @@ class HeartflowPlugin(star.Star):
         super().__init__(context)
         self.config = config
 
-        # 判断模型配置
-        self.judge_provider_name = self.config.get("judge_provider_name", "")
+        # ===== 分组配置读取 =====
+        cfg = self.config if isinstance(self.config, dict) else {}
+        heartflow_cfg = cfg.get("heartflow", {}) or {}
+        media_cfg = cfg.get("media", {}) or {}
+        summary_cfg = cfg.get("summary", {}) or {}
+        favor_cfg = cfg.get("favorability", {}) or {}
+
+        # 判断模型配置（heartflow）
+        self.judge_provider_name = heartflow_cfg.get("judge_provider_name", "")
+        # 启用总开关（heartflow）
+        self.enable_heartflow = heartflow_cfg.get("enable_heartflow", False)
         
-        # 媒体识别配置
-        self.enable_media_judge = self.config.get("enable_media_judge", False)
-        self.enable_media_recognition = self.config.get("enable_media_recognition", False)
-        self.image_recognition_provider_name = self.config.get("image_recognition_provider", "")
-        self.audio_recognition_provider_name = self.config.get("audio_recognition_provider", "")
-        self.image_recognition_prompt = self.config.get("image_recognition_prompt", "")
+        # 媒体识别配置（media）
+        self.enable_media_judge = media_cfg.get("enable_media_judge", False)
+        self.enable_media_recognition = media_cfg.get("enable_media_recognition", False)
+        self.image_recognition_provider_name = media_cfg.get("image_recognition_provider", "")
+        self.audio_recognition_provider_name = media_cfg.get("audio_recognition_provider", "")
+        self.image_recognition_prompt = media_cfg.get("image_recognition_prompt", "")
+        self.skip_gif_processing = media_cfg.get("skip_gif_processing", True)
         
         # 记录媒体识别配置状态
         if self.image_recognition_provider_name:
@@ -85,13 +91,13 @@ class HeartflowPlugin(star.Star):
         elif self.enable_media_recognition:
             logger.info("未配置语音识别服务，语音识别功能已禁用")
 
-        # 心流参数配置
-        self.reply_threshold = self.config.get("reply_threshold", 0.6)
-        self.energy_decay_rate = self.config.get("energy_decay_rate", 0.1)
-        self.energy_recovery_rate = self.config.get("energy_recovery_rate", 0.02)
-        self.message_window = self.config.get("message_window", 50)
-        self.whitelist_enabled = self.config.get("whitelist_enabled", False)
-        self.chat_whitelist = self.config.get("chat_whitelist", [])
+        # 心流参数配置（heartflow）
+        self.reply_threshold = heartflow_cfg.get("reply_threshold", 0.6)
+        self.energy_decay_rate = heartflow_cfg.get("energy_decay_rate", 0.1)
+        self.energy_recovery_rate = heartflow_cfg.get("energy_recovery_rate", 0.02)
+        self.message_window = heartflow_cfg.get("message_window", 50)
+        self.whitelist_enabled = heartflow_cfg.get("whitelist_enabled", False)
+        self.chat_whitelist = heartflow_cfg.get("chat_whitelist", [])
 
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
@@ -152,52 +158,50 @@ class HeartflowPlugin(star.Star):
         # 判断状态标记：用于过滤小模型的判断结果
         self.judging_sessions: set = set()  # 正在进行判断的会话ID集合
 
-        # 判断配置
-        self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
+        # 判断配置（heartflow）
+        self.judge_include_reasoning = heartflow_cfg.get("judge_include_reasoning", True)
+        self.judge_evaluation_rules = heartflow_cfg.get("judge_evaluation_rules", "")
+
+        # 提示词与总结配置（summary）
+        self.summary_provider_name = summary_cfg.get("summary_provider", "")
+        self.summary_prompt_override = summary_cfg.get("summary_prompt", "")
         
-        # 提示词与总结配置
-        self.judge_evaluation_rules = self.config.get("judge_evaluation_rules", "")
-        self.summarize_instruction = self.config.get("summarize_instruction", "")
-        self.summary_provider_name = self.config.get("summary_provider", "")
-        self.summary_prompt_override = self.config.get("summary_prompt", "")
+        # 好感度系统配置（favorability）
+        self.enable_favorability = favor_cfg.get("enable_favorability", False)
+        self.enable_global_favorability = favor_cfg.get("enable_global_favorability", False)
+        self.favorability_decay_daily = favor_cfg.get("favorability_decay_daily", 1.0)
+        self.initial_favorability = favor_cfg.get("initial_favorability", 10.0)
         
-        # 好感度系统配置
-        self.enable_favorability = self.config.get("enable_favorability", False)
-        self.enable_global_favorability = self.config.get("enable_global_favorability", False)
-        self.favorability_decay_daily = self.config.get("favorability_decay_daily", 1.0)
-        self.initial_favorability = self.config.get("initial_favorability", 10.0)
+        # 智能总结配置（summary）
+        self.enable_memory_system = summary_cfg.get("enable_memory_system", True)
+        self.memory_summary_threshold = summary_cfg.get("memory_summary_threshold", 0.8)
         
-        # 智能总结配置
-        self.enable_memory_system = self.config.get("enable_memory_system", True)
-        self.memory_summary_threshold = self.config.get("memory_summary_threshold", 0.8)
+        # AI拉黑系统配置（favorability）
+        self.enable_blacklist = favor_cfg.get("enable_blacklist", False)
         
-        # AI拉黑系统配置
-        self.enable_blacklist = self.config.get("enable_blacklist", False)
-        
-        # GIF处理配置
-        self.skip_gif_processing = self.config.get("skip_gif_processing", True)
+        # GIF处理配置（已在media分组读取）
         
         # 全局好感度存储：{user_id: favorability}
         # 跨群聊的用户好感度，不受白名单限制
         self.global_favorability: Dict[str, float] = {}
         self.global_interaction_count: Dict[str, int] = {}
         
-        # 好感度计算权重
+        # 好感度计算权重（favorability）
         self.fav_weights = {
-            "quality": self.config.get("fav_quality", 0.4),
-            "willingness": self.config.get("fav_willingness", 0.2),
-            "social": self.config.get("fav_social", 0.3),
-            "timing": self.config.get("fav_timing", 0.05),
-            "continuity": self.config.get("fav_continuity", 0.2),
+            "quality": favor_cfg.get("fav_quality", 0.4),
+            "willingness": favor_cfg.get("fav_willingness", 0.2),
+            "social": favor_cfg.get("fav_social", 0.3),
+            "timing": favor_cfg.get("fav_timing", 0.05),
+            "continuity": favor_cfg.get("fav_continuity", 0.2),
         }
         
-        # 判断权重配置
+        # 判断权重配置（heartflow）
         self.weights = {
-            "quality": self.config.get("judge_quality", 0.25),
-            "willingness": self.config.get("judge_willingness", 0.2),
-            "social": self.config.get("judge_social", 0.2),
-            "timing": self.config.get("judge_timing", 0.15),
-            "continuity": self.config.get("judge_continuity", 0.2)
+            "quality": heartflow_cfg.get("judge_quality", 0.25),
+            "willingness": heartflow_cfg.get("judge_willingness", 0.2),
+            "social": heartflow_cfg.get("judge_social", 0.2),
+            "timing": heartflow_cfg.get("judge_timing", 0.15),
+            "continuity": heartflow_cfg.get("judge_continuity", 0.2)
         }
         # 检查权重和
         weight_sum = sum(self.weights.values())
@@ -274,13 +278,8 @@ class HeartflowPlugin(star.Star):
             if not judge_provider:
                 return original_prompt
             
-            # 使用配置的总结指令，如果没有配置则使用默认指令
-            if self.summarize_instruction:
-                instruction = self.summarize_instruction
-            else:
-                instruction = "请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。总结后的内容应该在100-200字以内，突出最重要的角色特点。"
-            
-            summarize_prompt = f"""{instruction}
+            # 使用内置默认总结指令（不再支持自定义）
+            summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。总结后的内容应该在100-200字以内，突出最重要的角色特点。
 
 原始角色设定：
 {original_prompt}
@@ -545,10 +544,8 @@ class HeartflowPlugin(star.Star):
                     continuity=continuity,
                     reasoning=judge_data.get("reasoning", "") if self.judge_include_reasoning else "",
                     should_reply=should_reply,
-                    confidence=overall_score,  # 使用综合评分作为置信度
                     overall_score=overall_score,
-                    related_messages=[],  # 不再使用关联消息功能
-                    blacklist=judge_data.get("blacklist", "")  # 新增：拉黑动作
+                    blacklist=judge_data.get("blacklist", "")
                 )
                 
             except json.JSONDecodeError as e:
@@ -565,7 +562,7 @@ class HeartflowPlugin(star.Star):
         """群聊消息入口：检查过滤→记录消息→心流判断→设置唤醒标志"""
         
         # 基础检查：启用状态、白名单、非空消息
-        if not self.config.get("enable_heartflow", False):
+        if not self.enable_heartflow:
             return
         
         if self.whitelist_enabled:
@@ -723,7 +720,7 @@ class HeartflowPlugin(star.Star):
             # 过滤：小模型判断、未启用心流、不在白名单
             if chat_id in self.judging_sessions:
                 return
-            if not self.config.get("enable_heartflow", False):
+            if not self.enable_heartflow:
                 return
             if self.whitelist_enabled and (not self.chat_whitelist or chat_id not in self.chat_whitelist):
                 return
@@ -810,7 +807,7 @@ class HeartflowPlugin(star.Star):
         
         过滤：小模型判断、非群聊消息、不在白名单
         """
-        if not self.config.get("enable_heartflow", False):
+        if not self.enable_heartflow:
             return
         
         try:
@@ -836,7 +833,7 @@ class HeartflowPlugin(star.Star):
         """检查是否应该处理这条消息"""
 
         # 检查插件是否启用
-        if not self.config.get("enable_heartflow", False):
+        if not self.enable_heartflow:
             return False
 
         # 跳过已经被其他插件或系统标记为唤醒的消息
@@ -1509,13 +1506,15 @@ class HeartflowPlugin(star.Star):
     
     def _build_summary_prompt(self, messages: list) -> str:
         """构建总结提示词"""
-        # 支持自定义总结提示词：summary_prompt（配置中设置，留空使用默认）
-        if hasattr(self, 'summary_prompt_override') and self.summary_prompt_override:
-            base_prompt = self.summary_prompt_override.strip()
-            # 确保结尾有对话内容引导
-            if not base_prompt.endswith("\n"):
-                base_prompt += "\n"
-            prompt = f"{base_prompt}对话内容：\n"
+        # 支持自定义总结提示词（summary_prompt），否则使用内置默认提示词
+        if hasattr(self, "summary_prompt_override") and self.summary_prompt_override and self.summary_prompt_override.strip():
+            prompt = self.summary_prompt_override.strip()
+            # 若未包含“对话内容”提示，自动追加；并确保以换行结束，便于后续拼接
+            if "对话内容" not in prompt:
+                prompt += "\n对话内容：\n"
+            else:
+                if not prompt.endswith("\n"):
+                    prompt += "\n"
         else:
             prompt = """请用一段话总结以下群聊对话的关键信息。要求：
 - 客观记录：如实记录对话内容，包括话题转换和用户行为
@@ -1601,7 +1600,7 @@ class HeartflowPlugin(star.Star):
         """获取最近的对话上下文
         
         add_labels: True=小模型（添加[群友消息]/[我的回复]标注），False=大模型（原始格式）
-        返回最近N条消息（由 context_messages_count 配置）
+        返回最近N条消息（由 message_window 配置）
         """
         chat_id = event.unified_msg_origin
         
@@ -1611,7 +1610,7 @@ class HeartflowPlugin(star.Star):
             return []
         
         buffer_messages = self.message_buffer[chat_id]
-        # 获取最近的 context_messages_count 条消息
+        # 获取最近的 message_window 条消息
         recent_messages = buffer_messages[-self.message_window:] if len(buffer_messages) > self.message_window else buffer_messages
         
         filtered_context = []
