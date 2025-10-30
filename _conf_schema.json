@@ -23,6 +23,18 @@
     "default": true,
     "hint": "启用后，GIF文件将跳过识别和心流判断"
   },
+  "enable_memory_system": {
+    "description": "启用智能总结",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
+  },
+  "enable_blacklist": {
+    "description": "启用智能拉黑",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后，AI会根据消息内容动态判断是否需要拉黑或解封用户"
+  },
   "judge_provider_name": {
     "description": "判断模型提供商名称",
     "type": "string",
@@ -34,21 +46,34 @@
     "description": "图片识别模型提供商名称",
     "type": "string",
     "default": "",
-    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型。",
+    "hint": "专门用于图片内容识别的模型提供商名称。留空则使用判断模型",
     "_special": "select_provider"
   },
   "audio_recognition_provider": {
     "description": "语音识别模型提供商名称",
     "type": "string",
     "default": "",
-    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型。",
+    "hint": "专门用于语音转文字的STT模型提供商名称。留空则使用判断模型",
     "_special": "select_provider_stt"
+  },
+  "summary_provider": {
+    "description": "总结模型提供商名称",
+    "type": "string",
+    "default": "",
+    "hint": "用于总结的模型提供商。留空则不启用",
+    "_special": "select_provider"
   },
   "image_recognition_prompt": {
     "description": "图片识别提示词",
     "type": "text",
     "default": "",
-    "hint": "图片识别的用户提示词。留空则使用默认提示词。"
+    "hint": "图片识别的用户提示词。留空则使用默认提示词"
+  },
+  "summary_prompt": {
+    "description": "总结提示词",
+    "type": "text",
+    "default": "",
+    "hint": "用于历史消息总结的自定义提示词。留空则使用默认提示词"
   },
   "reply_threshold": {
     "description": "回复阈值(0-1)",
@@ -68,11 +93,11 @@
     "default": 0.02,
     "hint": "每次不回复时精力恢复的幅度"
   },
-  "context_messages_count": {
-    "description": "上下文消息数量",
+  "message_window": {
+    "description": "消息窗口大小",
     "type": "int",
-    "default": 5,
-    "hint": "判断时考虑的最近消息数量"
+    "default": 50,
+    "hint": "同时作为消息缓冲区大小与判断时使用的最近消息数量"
   },
   "whitelist_enabled": {
     "description": "启用群聊白名单",
@@ -126,7 +151,7 @@
     "description": "判断评估规则",
     "type": "text",
     "default": "",
-    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则。",
+    "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则",
     "editor_mode": true,
     "editor_language": "markdown"
   },
@@ -134,19 +159,13 @@
     "description": "系统提示词总结指令",
     "type": "text",
     "default": "",
-    "hint": "自定义精简提示词，说明如何总结机器人角色设定。留空使用默认指令。"
-  },
-  "max_buffer_size": {
-    "description": "消息缓冲区大小",
-    "type": "int",
-    "default": 50,
-    "hint": "每个群聊最多缓存的消息数量，用于保存完整对话历史（包括未回复的消息）。建议15-100条。"
+    "hint": "自定义精简提示词，说明如何总结机器人角色设定。留空使用默认指令"
   },
   "enable_favorability": {
     "description": "启用好感度系统",
     "type": "bool",
     "default": false,
-    "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况。"
+    "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况"
   },
   "enable_global_favorability": {
     "description": "启用全局好感度",
@@ -158,13 +177,13 @@
     "description": "新用户初始好感度",
     "type": "float",
     "default": 10.0,
-    "hint": "新用户第一次互动时的好感度初始值（0-100）。"
+    "hint": "新用户第一次互动时的好感度初始值（0-100）"
   },
   "favorability_decay_daily": {
     "description": "每日好感度衰减",
     "type": "float",
     "default": 1.0,
-    "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0。"
+    "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0"
   },
   "fav_quality": {
     "description": "内容价值性的好感度权重",
@@ -196,22 +215,10 @@
     "default": 0.05,
     "hint": "时机把握对好感度的影响权重，默认5%"
   },
-  "enable_memory_system": {
-    "description": "启用智能总结",
-    "type": "bool",
-    "default": true,
-    "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆"
-  },
   "memory_summary_threshold": {
     "description": "记忆总结阈值",
     "type": "float",
     "default": 0.8,
     "hint": "当缓冲区达到此比例时触发总结。"
-  },
-  "enable_blacklist": {
-    "description": "启用智能拉黑",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，AI会根据消息内容动态判断是否需要拉黑或解封用户"
   }
 }

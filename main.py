@@ -89,7 +89,7 @@ class HeartflowPlugin(star.Star):
         self.reply_threshold = self.config.get("reply_threshold", 0.6)
         self.energy_decay_rate = self.config.get("energy_decay_rate", 0.1)
         self.energy_recovery_rate = self.config.get("energy_recovery_rate", 0.02)
-        self.context_messages_count = self.config.get("context_messages_count", 5)
+        self.message_window = self.config.get("message_window", 50)
         self.whitelist_enabled = self.config.get("whitelist_enabled", False)
         self.chat_whitelist = self.config.get("chat_whitelist", [])
 
@@ -143,7 +143,7 @@ class HeartflowPlugin(star.Star):
         #
         # 注意：缓冲区采用"从现在开始记录"策略，不回溯历史
         self.message_buffer: Dict[str, list] = {}
-        self.max_buffer_size = self.config.get("max_buffer_size", 50)  # 每个群聊最多缓存50条
+        self.max_buffer_size = self.message_window  # 使用统一窗口大小
         
         # ===== AI拉黑系统 =====
         # 结构：{user_id: bool} - 简单的拉黑状态
@@ -155,9 +155,11 @@ class HeartflowPlugin(star.Star):
         # 判断配置
         self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
         
-        # 提示词配置
+        # 提示词与总结配置
         self.judge_evaluation_rules = self.config.get("judge_evaluation_rules", "")
         self.summarize_instruction = self.config.get("summarize_instruction", "")
+        self.summary_provider_name = self.config.get("summary_provider", "")
+        self.summary_prompt_override = self.config.get("summary_prompt", "")
         
         # 好感度系统配置
         self.enable_favorability = self.config.get("enable_favorability", False)
@@ -264,6 +266,7 @@ class HeartflowPlugin(star.Star):
     async def _summarize_system_prompt(self, original_prompt: str) -> str:
         """使用小模型对系统提示词进行总结"""
         try:
+            # 使用判断模型进行系统提示词总结
             if not self.judge_provider_name:
                 return original_prompt
             
@@ -1506,7 +1509,15 @@ class HeartflowPlugin(star.Star):
     
     def _build_summary_prompt(self, messages: list) -> str:
         """构建总结提示词"""
-        prompt = """请用一段话总结以下群聊对话的关键信息。要求：
+        # 支持自定义总结提示词：summary_prompt（配置中设置，留空使用默认）
+        if hasattr(self, 'summary_prompt_override') and self.summary_prompt_override:
+            base_prompt = self.summary_prompt_override.strip()
+            # 确保结尾有对话内容引导
+            if not base_prompt.endswith("\n"):
+                base_prompt += "\n"
+            prompt = f"{base_prompt}对话内容：\n"
+        else:
+            prompt = """请用一段话总结以下群聊对话的关键信息。要求：
 - 客观记录：如实记录对话内容，包括话题转换和用户行为
 - 重点提取：识别主要话题、重要事件、用户关系变化
 - 行为分析：注意用户的行为模式，包括正常交流和不当言论
@@ -1533,10 +1544,13 @@ class HeartflowPlugin(star.Star):
     async def _call_ai_for_summary(self, prompt: str) -> str:
         """调用AI进行总结"""
         try:
-            # 使用判断模型进行总结
-            provider = self.context.get_provider_by_id(self.judge_provider_name)
+            # 仅在配置了总结专用模型时启用
+            if not self.summary_provider_name:
+                logger.debug("未配置summary_provider，跳过历史总结")
+                return ""
+            provider = self.context.get_provider_by_id(self.summary_provider_name)
             if not provider:
-                logger.error(f"找不到判断模型提供商: {self.judge_provider_name}")
+                logger.error(f"找不到总结模型提供商: {self.summary_provider_name}")
                 return ""
             
             # 调用AI - text_chat 需要直接传入 prompt 字符串
@@ -1598,7 +1612,7 @@ class HeartflowPlugin(star.Star):
         
         buffer_messages = self.message_buffer[chat_id]
         # 获取最近的 context_messages_count 条消息
-        recent_messages = buffer_messages[-self.context_messages_count:] if len(buffer_messages) > self.context_messages_count else buffer_messages
+        recent_messages = buffer_messages[-self.message_window:] if len(buffer_messages) > self.message_window else buffer_messages
         
         filtered_context = []
         for msg in recent_messages:
@@ -1723,6 +1737,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(status_info))
 
     # 管理员命令：重置心流状态
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_reset")
     async def heartflow_reset(self, event: AstrMessageEvent):
         """重置心流状态"""
@@ -1759,6 +1774,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(cache_info))
 
     # 管理员命令：清除系统提示词缓存
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_cache_clear")
     async def heartflow_cache_clear(self, event: AstrMessageEvent):
         """清除系统提示词缓存"""
@@ -1795,6 +1811,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(buffer_info))
     
     # 管理员命令：清除消息缓冲区
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_buffer_clear")
     async def heartflow_buffer_clear(self, event: AstrMessageEvent):
         """清除当前群聊的消息缓冲区"""
@@ -1808,7 +1825,7 @@ class HeartflowPlugin(star.Star):
         else:
             event.set_result(event.plain_result("当前群聊缓冲区为空，无需清除"))
     
-    # 管理员命令：查看好感度
+    # 用户命令：查看好感度
     @filter.command("heartflow_fav")
     async def heartflow_favorability(self, event: AstrMessageEvent):
         """查看当前用户的好感度"""
@@ -1846,7 +1863,7 @@ class HeartflowPlugin(star.Star):
         
         event.set_result(event.plain_result(fav_info))
     
-    # 管理员命令：好感度排行榜
+    # 用户命令：好感度排行榜
     @filter.command("heartflow_fav_rank")
     async def heartflow_favorability_rank(self, event: AstrMessageEvent):
         """查看当前群聊的好感度排行榜"""
@@ -1881,6 +1898,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(result))
     
     # 管理员命令：重置好感度
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_fav_reset")
     async def heartflow_favorability_reset(self, event: AstrMessageEvent):
         """重置当前群聊所有用户的好感度"""
@@ -1906,6 +1924,7 @@ class HeartflowPlugin(star.Star):
         logger.info(f"好感度已重置: {chat_id} ({user_count}个用户)")
 
     # 管理员命令：手动保存好感度
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_fav_save")
     async def heartflow_favorability_save(self, event: AstrMessageEvent):
         """手动保存好感度数据到文件"""
@@ -1937,7 +1956,7 @@ class HeartflowPlugin(star.Star):
             event.set_result(event.plain_result(f"保存失败: {e}"))
             logger.error(f"手动保存好感度失败: {e}")
     
-    # AI拉黑系统管理命令
+    # 用户命令：查看拉黑系统状态
     @filter.command("heartflow_blacklist_status")
     async def heartflow_blacklist_status(self, event: AstrMessageEvent):
         """查看拉黑系统状态"""
@@ -1960,6 +1979,8 @@ class HeartflowPlugin(star.Star):
         
         event.set_result(event.plain_result(result))
     
+    # 管理员命令：手动解封用户
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_unblacklist")
     async def heartflow_unblacklist(self, event: AstrMessageEvent):
         """手动解封用户"""
