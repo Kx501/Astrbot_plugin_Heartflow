@@ -18,6 +18,8 @@
       "judge_continuity": { "type": "float", "default": 0.2, "description": "对话连贯性的判断权重", "hint": "针对对话连贯性的判断权重设置，默认20%" },
       "judge_include_reasoning": { "type": "bool", "default": true, "description": "判断时是否包含理由", "hint": "让小模型在判断时返回详细理由。关闭可轻微提升性能和鲁棒性。" },
       "judge_evaluation_rules": { "type": "text", "default": "", "description": "判断评估规则", "hint": "自定义评估规则内容，不能更改维度，留空使用默认的评估规则", "editor_mode": true, "editor_language": "markdown" }
+      ,
+      "system_prefix_filters": { "type": "list", "default": [], "description": "系统指令前缀过滤", "hint": "以这些前缀开头的文本消息将被心流忽略（例如 / . ! # 等）" }
     }
   },
   
@@ -35,7 +37,7 @@
   },
   
   "summary": {
-    "description": "总结相关配置",
+    "description": "消息总结相关配置",
     "type": "object",
     "items": {
       "enable_memory_system": { "type": "bool", "default": true, "description": "启用智能总结", "hint": "启用后，当消息缓冲区接近满时会自动总结历史消息，保持长期记忆" },
@@ -49,7 +51,7 @@
     "description": "好感度相关配置",
     "type": "object",
     "items": {
-      "enable_favorability": { "type": "bool", "default": false, "description": "启用好感度系统", "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况" },
+      "enable_favorability": { "type": "bool", "default": false, "description": "启用好感度", "hint": "启用后，机器人会记住与每个用户的互动质量，记录不同用户的互动情况" },
       "enable_global_favorability": { "type": "bool", "default": false, "description": "启用全局好感度", "hint": "启用后，用户的好感度在所有群聊中共享。注意：如果启用了白名单，全局好感度也只在白名单群聊中生效。前置条件：enable_favorability=true" },
       "initial_favorability": { "type": "float", "default": 10.0, "description": "新用户初始好感度", "hint": "新用户第一次互动时的好感度初始值（0-100）" },
       "favorability_decay_daily": { "type": "float", "default": 1.0, "description": "每日好感度衰减", "hint": "每天自动向中性值(50)回归的速度。0=不衰减，1.0=标准衰减（>50时每天—1.5，<50时每天+2.0），2.0=双倍衰减。建议0.5-2.0" },

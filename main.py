@@ -98,6 +98,7 @@ class HeartflowPlugin(star.Star):
         self.message_window = heartflow_cfg.get("message_window", 50)
         self.whitelist_enabled = heartflow_cfg.get("whitelist_enabled", False)
         self.chat_whitelist = heartflow_cfg.get("chat_whitelist", [])
+        self.system_prefix_filters = heartflow_cfg.get("system_prefix_filters", [])
 
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
@@ -459,7 +460,7 @@ class HeartflowPlugin(star.Star):
 机器人状态:
 我的精力水平: {chat_state.energy:.1f}/1.0
 最近活跃度: {'高' if chat_state.total_messages > 100 else '中' if chat_state.total_messages > 20 else '低'}
-上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
+上次发言: {self._get_time_since_last_reply(event.unified_msg_origin)}秒前
 历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%{fav_info}
 
 待判断消息:
@@ -572,6 +573,24 @@ class HeartflowPlugin(star.Star):
         
         if event.get_sender_id() == event.get_self_id():
             return
+        
+        # 系统指令前缀过滤（在最开始检查，处理所有类型消息）
+        if isinstance(self.system_prefix_filters, list) and self.system_prefix_filters:
+            try:
+                # 从 message_obj.raw_message 获取原始消息对象（包含前缀的文本）
+                if hasattr(event, 'message_obj'):
+                    raw_msg_obj = getattr(event.message_obj, 'raw_message', None)
+                    if raw_msg_obj and hasattr(raw_msg_obj, 'raw_message'):
+                        # 获取原始消息文本（包含前缀）
+                        check_text = str(raw_msg_obj.raw_message).strip()
+                        
+                        # 检查是否匹配配置的前缀
+                        for prefix in self.system_prefix_filters:
+                            if isinstance(prefix, str) and prefix and check_text.startswith(prefix):
+                                logger.debug(f"✏️ 命中前缀过滤，跳过: {check_text[:30]}...")
+                                return
+            except Exception:
+                pass
         
         # 获取媒体类型，如果不是unknown则认为是媒体消息
         media_type = self._get_media_type(event)
@@ -882,14 +901,14 @@ class HeartflowPlugin(star.Star):
 
         return state
 
-    def _get_minutes_since_last_reply(self, chat_id: str) -> int:
-        """获取距离上次回复的分钟数"""
+    def _get_time_since_last_reply(self, chat_id: str) -> int:
+        """获取距离上次回复的秒数"""
         chat_state = self._get_chat_state(chat_id)
 
         if chat_state.last_reply_time == 0:
             return 999  # 从未回复过
 
-        return int((time.time() - chat_state.last_reply_time) / 60)
+        return int(time.time() - chat_state.last_reply_time)
 
     # ===== 好感度系统方法 =====
     
@@ -1707,7 +1726,7 @@ class HeartflowPlugin(star.Star):
 当前状态:
 - 群聊ID: {event.unified_msg_origin}
 - 精力水平: {chat_state.energy:.2f}/1.0 {'高' if chat_state.energy > 0.7 else '中' if chat_state.energy > 0.3 else '低'}
-- 上次回复: {self._get_minutes_since_last_reply(chat_id)}分钟前
+- 上次回复: {self._get_time_since_last_reply(chat_id)}秒前
 
 历史统计:
 - 总消息数: {chat_state.total_messages}
@@ -1886,7 +1905,7 @@ class HeartflowPlugin(star.Star):
         )
         
         result = "好感度排行榜\n\n"
-        for i, (uid, fav) in enumerate[tuple[str, float]][tuple[str, float]](sorted_users[:10], 1):
+        for i, (uid, fav) in enumerate(sorted_users[:10], 1):
             level, emoji = self._get_favorability_level(fav)
             interaction = chat_state.user_interaction_count.get(uid, 0)
             result += f"{i}. 用户{uid}:\n{fav:.0f}/100 {emoji} ({level}, {interaction}次互动)\n"
